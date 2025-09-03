@@ -2186,7 +2186,7 @@ class openpylivox(object):
                 status_message = status_message[:-1]
                 print(status_message)
                 if self._showMessages:
-                    print("Attempting to auto-connect to the Livox " + unique_sensors[0] + " with S/N: " + unique_serialNums[0])
+                    print(f"Attempting to auto-connect to the Livox {unique_sensors[0]} with S/N: {unique_serialNums[0]}")
 
                 if unique_sensors[0] == "Mid-100":
                     sensor_IPs = None
