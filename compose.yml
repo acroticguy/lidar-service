@@ -1,0 +1,10 @@
+services:
+  lidar-service:
+    build: .
+    network_mode: "host" # For LAN visibility
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    cap_add:
+      - NET_RAW
