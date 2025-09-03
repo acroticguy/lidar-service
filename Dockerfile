@@ -28,6 +28,9 @@ COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 # Copy the application code
 COPY . .
 
+# Set PYTHONPATH to include the app directory
+ENV PYTHONPATH=/app
+
 # Expose the port FastAPI runs on
 EXPOSE 8000
 
