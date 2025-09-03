@@ -301,8 +301,10 @@ class LidarManager:
         def do_auto_connect():
             nonlocal connected_count
             already_connected_ids = set()
+            start_time = time.time()
+            timeout = 30  # 30 second timeout for auto-connect
 
-            while True:
+            while time.time() - start_time < timeout:
                 sensor = opl.openpylivox(showMessages=True)
 
                 # Prevent monitoring thread from starting
@@ -411,8 +413,10 @@ class LidarManager:
                 except Exception as e:
                     logger.error(f"Error updating info for sensor {sensor_id}: {str(e)}")
 
+        except OSError as e:
+            logger.warning(f"Network error during auto-connect (sensors may be unreachable): {e}")
         except Exception as e:
-            logger.error(f"Error in auto-connect: {str(e)}")
+            logger.error(f"Error in auto-connect: {type(e).__name__}: {str(e)}")
 
         logger.info(f"Auto-connected to {connected_count} sensors")
         return connected_count

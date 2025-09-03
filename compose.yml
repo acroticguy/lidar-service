@@ -8,3 +8,5 @@ services:
       - .:/app
     cap_add:
       - NET_RAW
+    environment:
+      - PORT=8001  # Override port to avoid conflict with port 8000
