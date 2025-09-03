@@ -1525,7 +1525,6 @@ class openpylivox(object):
         self._captureStream = None
         self._serial = "UNKNOWN"
         self._ipRangeCode = 0
-        self._computerIP = ""
         self._sensorIP = ""
         self._dataPort = -1
         self._cmdPort = -1
@@ -1535,6 +1534,28 @@ class openpylivox(object):
         self._deviceType = "UNKNOWN"
         self._mid100_sensors = []
         self._format_spaces = ""
+        
+        # Auto get the computer's IP address on init
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Doesn't actually connect, but forces a lookup for an outbound interface
+            s.connect(('10.255.255.255', 1)) # Connect to an unreachable address
+            IP = s.getsockname()[0]
+        except Exception:
+            # Fallback for when the above fails (e.g., no network route)
+            IP = '127.0.0.1' # Or raise an error
+            # Try to iterate through common interfaces if the above fails
+            try:
+                # Get a list of interfaces that are not loopback
+                for interface in socket.gethostbyname_ex(socket.gethostname())[2]:
+                    if not interface.startswith('127.'):
+                        IP = interface
+                        break
+            except socket.gaierror:
+                pass # Still couldn't find it
+        finally:
+            s.close()
+        self._computerIP = IP
 
     def _reinit(self):
 
