@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 import json
 from typing import List, Dict, Any
+from ..core.config import settings
 from ..core.logging_config import logger
 from .berthing_data_core import fetch_berthing_data_for_sensor
 
@@ -18,7 +19,7 @@ class DatabaseConsumer:
         self.postgrest_url = postgrest_url
         self.stop_event = asyncio.Event()  # Async event for signaling stop
         self.consumer_tasks = {}  # Stores asyncio.Task objects, mapped by sensor_id
-        self.fastapi_server = "http://localhost:8000/api/v1"
+        self.fastapi_server = f"http://{settings.HOST}:{settings.PORT}/api/v1"
         # Shared httpx client to reduce overhead of client creation if many tasks run concurrently
         # and PostgREST/FastAPI can handle persistent connections well.
         self.http_client = httpx.AsyncClient(timeout=10)

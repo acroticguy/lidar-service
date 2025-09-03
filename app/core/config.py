@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     DESCRIPTION: str = "FastAPI service for controlling Livox LiDAR sensors"
 
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = 8001
 
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "logs/lidar_service.log"
