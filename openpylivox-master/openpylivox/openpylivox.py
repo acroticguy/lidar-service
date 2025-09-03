@@ -1559,6 +1559,23 @@ class openpylivox(object):
 
     def _reinit(self):
 
+        # Close any existing sockets first to prevent port conflicts
+        if hasattr(self, '_dataSocket') and self._dataSocket:
+            try:
+                self._dataSocket.close()
+            except:
+                pass
+        if hasattr(self, '_cmdSocket') and self._cmdSocket:
+            try:
+                self._cmdSocket.close()
+            except:
+                pass
+        if hasattr(self, '_imuSocket') and self._imuSocket:
+            try:
+                self._imuSocket.close()
+            except:
+                pass
+
         self._dataSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._cmdSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._imuSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1758,7 +1775,9 @@ class openpylivox(object):
             return assignedDataPort, assignedCmdPort, assignedIMUPort
 
         except socket.error as err:
-            print(" *** ERROR: cannot bind to specified IP:Port(s), " + err)
+            print(" *** ERROR: cannot bind to specified IP:Port(s), " + str(err))
+            print(" *** This often happens when ports are still in use from previous connection")
+            print(" *** Wait a few seconds and try again, or restart the container")
             sys.exit(3)
 
     def _waitForIdle(self):
@@ -2281,8 +2300,31 @@ class openpylivox(object):
                 time.sleep(0.2)
                 self._heartbeat = None
 
-                self._dataSocket.close()
-                self._cmdSocket.close()
+                # Properly close sockets with SO_REUSEADDR to prevent "Address already in use" errors
+                if hasattr(self, '_dataSocket') and self._dataSocket:
+                    try:
+                        self._dataSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        self._dataSocket.close()
+                    except:
+                        pass
+                
+                if hasattr(self, '_cmdSocket') and self._cmdSocket:
+                    try:
+                        self._cmdSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        self._cmdSocket.close()
+                    except:
+                        pass
+                
+                if hasattr(self, '_imuSocket') and self._imuSocket:
+                    try:
+                        self._imuSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        self._imuSocket.close()
+                    except:
+                        pass
+                
+                # Give OS time to release the ports
+                time.sleep(0.5)
+                
                 if self._showMessages: print("Disconnected from the Livox " + self._deviceType + " at IP: " + self._sensorIP)
 
             except:
