@@ -292,10 +292,32 @@ class LidarManager:
         """Auto-connect to all available sensors"""
         connected_count = 0
 
-        # Get local IP if not provided
+        # Attempt getting local IP if not provided
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Doesn't actually connect, but forces a lookup for an outbound interface
+            s.connect(('10.255.255.255', 1)) # Connect to an unreachable address
+            IP = s.getsockname()[0]
+        except Exception:
+            # Fallback for when the above fails (e.g., no network route)
+            IP = '127.0.0.1' # Or raise an error
+            # Try to iterate through common interfaces if the above fails
+            try:
+                # Get a list of interfaces that are not loopback
+                for interface in socket.gethostbyname_ex(socket.gethostname())[2]:
+                    if not interface.startswith('127.'):
+                        IP = interface
+                        break
+            except socket.gaierror:
+                pass # Still couldn't find it
+        finally:
+            s.close()
+        
+        computer_ip = computer_ip or IP
+        
         if not computer_ip:
             # Use the IP that works with the sensor network
-            computer_ip = '192.168.1.50'
+            computer_ip = '192.168.1.50' # Fallback
             logger.info(f"Using configured computer IP: {computer_ip}")
 
         def do_auto_connect():
