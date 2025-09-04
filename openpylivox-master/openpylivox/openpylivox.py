@@ -1641,7 +1641,7 @@ class openpylivox(object):
             print("\n* ERROR: specified sensor IP:Command Port cannot connect to a Livox sensor *")
             print("* common causes are a wrong IP or the command port is being used already   *\n")
             time.sleep(0.1)
-            sys.exit(2)
+            return False
 
         return unique_serialNums, unique_sensors, sensor_IPs
 
@@ -1744,46 +1744,62 @@ class openpylivox(object):
             # Doesn't actually connect, but forces a lookup for an outbound interface
             s.connect(('10.255.255.255', 1)) # Connect to an unreachable address
             IP = s.getsockname()[0]
-        except Exception:
+            print(f"DEBUG: Detected IP via socket connect: {IP}")
+        except Exception as e:
+            print(f"DEBUG: Socket connect failed: {e}")
             # Fallback for when the above fails (e.g., no network route)
             IP = '127.0.0.1' # Or raise an error
             # Try to iterate through common interfaces if the above fails
             try:
                 # Get a list of interfaces that are not loopback
-                for interface in socket.gethostbyname_ex(socket.gethostname())[2]:
+                hostname_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+                print(f"DEBUG: Hostname IPs found: {hostname_ips}")
+                for interface in hostname_ips:
                     if not interface.startswith('127.'):
                         IP = interface
+                        print(f"DEBUG: Selected interface IP: {IP}")
                         break
-            except socket.gaierror:
+            except socket.gaierror as ge:
+                print(f"DEBUG: Hostname lookup failed: {ge}")
                 pass # Still couldn't find it
         finally:
             s.close()
+        
+        print(f"DEBUG: Final computer IP set to: {IP}")
         self._computerIP = IP
 
     def _bindPorts(self):
 
         try:
-            self._dataSocket.bind((self._computerIP, self._dataPort))
-            self._cmdSocket.bind((self._computerIP, self._cmdPort))
-            self._imuSocket.bind((self._computerIP, self._imuPort))
+            # In containerized environments, bind to 0.0.0.0 to listen on all interfaces
+            # but keep self._computerIP for communication purposes
+            bind_ip = "0.0.0.0"
+            print(f"DEBUG: Binding sockets to {bind_ip} (communication IP: {self._computerIP})")
+            
+            self._dataSocket.bind((bind_ip, self._dataPort))
+            self._cmdSocket.bind((bind_ip, self._cmdPort))
+            self._imuSocket.bind((bind_ip, self._imuPort))
             assignedDataPort = self._dataSocket.getsockname()[1]
             assignedCmdPort = self._cmdSocket.getsockname()[1]
             assignedIMUPort = self._imuSocket.getsockname()[1]
 
+            print(f"DEBUG: Successfully bound ports - Data: {assignedDataPort}, Cmd: {assignedCmdPort}, IMU: {assignedIMUPort}")
             time.sleep(0.1)
 
             return assignedDataPort, assignedCmdPort, assignedIMUPort
 
         except socket.error as err:
-            print(" *** ERROR: cannot bind to specified IP:Port(s), " + str(err))
+            print(f" *** ERROR: cannot bind to IP {bind_ip} with ports Data:{self._dataPort}, Cmd:{self._cmdPort}, IMU:{self._imuPort}")
+            print(f" *** Socket error: {str(err)}")
             print(" *** This often happens when ports are still in use from previous connection")
             print(" *** Wait a few seconds and try again, or restart the container")
             sys.exit(3)
 
     def _waitForIdle(self):
 
-        while self._heartbeat.idle_state != 9:
-            time.sleep(0.1)
+        if self._heartbeat is not None:
+            while self._heartbeat.idle_state != 9:
+                time.sleep(0.1)
 
     def _disconnectSensor(self):
 
@@ -2100,7 +2116,10 @@ class openpylivox(object):
                 num_spaces = 15 - len(self._sensorIP)
                 for i in range(num_spaces):
                     self._format_spaces += " "
-                unique_serialNums, unique_sensors, sensor_IPs = self._reinit()
+                reinit_success = self._reinit()
+                if not reinit_success:
+                    return False
+                unique_serialNums, unique_sensors, sensor_IPs = reinit_success
                 numFound = len(unique_sensors)
                 time.sleep(0.1)
 
@@ -2286,56 +2305,86 @@ class openpylivox(object):
     def _disconnect(self):
 
         if self._isConnected:
-            self._isConnected = False
-            self._isData = False
+            # Stop any active data capture stream first.
             if self._captureStream is not None:
-                self._captureStream.stop()
+                try:
+                    self._captureStream.stop()
+                except Exception as e:
+                    if self._showMessages: print(f"DEBUG: Error stopping capture stream for {self._sensorIP}: {e}")
                 self._captureStream = None
-            time.sleep(0.1)
-            self._isWriting = False
 
+            # Send the disconnect command to the sensor before stopping heartbeat.
             try:
                 self._disconnectSensor()
-                self._heartbeat.stop()
-                time.sleep(0.2)
+            except Exception as e:
+                if self._showMessages: print(f"DEBUG: Error sending disconnect command to {self._sensorIP}: {e}")
+
+            # Stop the heartbeat thread.
+            if self._heartbeat is not None:
+                try:
+                    self._heartbeat.stop()
+                    time.sleep(0.2) # Give thread time to join
+                except Exception as e:
+                    if self._showMessages: print(f"DEBUG: Error stopping heartbeat for {self._sensorIP}: {e}")
                 self._heartbeat = None
 
-                # Properly close sockets with SO_REUSEADDR to prevent "Address already in use" errors
-                if hasattr(self, '_dataSocket') and self._dataSocket:
+            # Close all sockets safely.
+            for sock in ['_dataSocket', '_cmdSocket', '_imuSocket']:
+                if hasattr(self, sock) and getattr(self, sock):
                     try:
-                        self._dataSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        self._dataSocket.close()
-                    except:
-                        pass
-                
-                if hasattr(self, '_cmdSocket') and self._cmdSocket:
-                    try:
-                        self._cmdSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        self._cmdSocket.close()
-                    except:
-                        pass
-                
-                if hasattr(self, '_imuSocket') and self._imuSocket:
-                    try:
-                        self._imuSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        self._imuSocket.close()
-                    except:
-                        pass
-                
-                # Give OS time to release the ports
-                time.sleep(0.5)
-                
-                if self._showMessages: print("Disconnected from the Livox " + self._deviceType + " at IP: " + self._sensorIP)
+                        getattr(self, sock).close()
+                    except Exception as e:
+                        if self._showMessages: print(f"DEBUG: Error closing {sock} for {self._sensorIP}: {e}")
 
-            except:
-                if self._showMessages: print("*** Error trying to disconnect from the Livox " + self._deviceType + " at IP: " + self._sensorIP)
-        else:
-            if self._showMessages: print("Not connected to the Livox " + self._deviceType + " at IP: " + self._sensorIP)
+            if self._showMessages: print("Disconnected from the Livox " + self._deviceType + " at IP: " + self._sensorIP)
+        
+        # Even if not connected, ensure all state variables are reset for reuse.
+        # This is crucial for fixing the reuse bug.
+        self._isConnected = False
+        self._isData = False
+        self._isWriting = False
+        self._dataSocket = ""
+        self._cmdSocket = ""
+        self._imuSocket = ""
+        self._firmware = "UNKNOWN"
+        self._coordSystem = -1
+        self._x = None
+        self._y = None
+        self._z = None
+        self._roll = None
+        self._pitch = None
+        self._yaw = None
+        self._serial = "UNKNOWN"
+        self._ipRangeCode = 0
+        self._sensorIP = ""
+        self._dataPort = -1
+        self._cmdPort = -1
+        self._imuPort = -1
+        self._deviceType = "UNKNOWN"
+        self._format_spaces = ""
 
     def disconnect(self):
+        """
+        Safely disconnects from the Livox sensor(s) and fully resets the object's
+        state, allowing it to be reused for a new connection without errors.
+        """
+        # Disconnect any child sensors from an auto-connection first.
+        if self._mid100_sensors:
+            if self._showMessages: print("--- Disconnecting child sensors ---")
+            for sensor in self._mid100_sensors:
+                sensor._disconnect() # Use the internal disconnect
+            if self._showMessages: print("-----------------------------------------")
+
+        # Disconnect the main sensor instance.
         self._disconnect()
-        for i in range(len(self._mid100_sensors)):
-            self._mid100_sensors[i]._disconnect()
+
+        # Give the OS a moment to release network ports.
+        time.sleep(0.5)
+
+        # --- CRITICAL FIX: Reset all state to allow object reuse ---
+        # This brings the object back to its pre-connection state.
+        if self._showMessages: print("--- Resetting object state for reuse ---")
+        self.__init__(self._showMessages)
 
     def _reboot(self):
 
