@@ -292,6 +292,157 @@ async def activate_berthing_by_berth(berth_id: int, computer_ip: Optional[str] =
         )
 
 
+@router.get("/{berth_id}/view_sensors", response_model=Dict[str, Any])
+async def get_berth_sensors_status(berth_id: int):
+    """
+    Get the status of all sensors related to a specific berth.
+
+    This endpoint:
+    1. Queries the database to find all lasers for the berth
+    2. Retrieves the current status of each sensor
+    3. Returns comprehensive sensor status information
+
+    Args:
+        berth_id: The berth ID to get sensor status for
+
+    Returns:
+        Dictionary with sensor status results including:
+        - success: Whether the query was successful
+        - berth_id: The berth ID that was processed
+        - sensors: List of sensor status information
+        - sensor_count: Number of sensors found
+        - connected_count: Number of sensors currently connected
+        - streaming_count: Number of sensors currently streaming
+        - berthing_mode_count: Number of sensors in berthing mode
+    """
+    import httpx
+    from ...core.config import settings
+
+    try:
+        logger.info(f"Getting sensor status for berth {berth_id}")
+
+        # Step 1: Query database for lasers associated with this berth via PostgREST
+        logger.info(f"Querying database for lasers associated with berth {berth_id}")
+
+        postgrest_url = f"{settings.DB_HOST}/rpc/get_lasers_by_berth"
+        headers = {'Content-Type': 'application/json'}
+        payload = {"p_berth_id": berth_id}
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(postgrest_url, headers=headers, json=payload)
+            response.raise_for_status()
+            laser_data = response.json()
+
+        if not laser_data:
+            logger.warning(f"No lasers found for berth {berth_id}")
+            return {
+                "success": True,
+                "berth_id": berth_id,
+                "message": f"No lasers found for berth {berth_id}",
+                "sensors": [],
+                "sensor_count": 0,
+                "connected_count": 0,
+                "streaming_count": 0,
+                "berthing_mode_count": 0
+            }
+
+        # Extract sensor IDs from the laser data
+        sensor_ids = []
+        laser_info = {}
+        for laser in laser_data:
+            sensor_id = laser.get('serial')
+            if sensor_id:
+                sensor_ids.append(sensor_id)
+                laser_info[sensor_id] = laser
+
+        logger.info(f"Found {len(sensor_ids)} sensors for berth {berth_id}: {sensor_ids}")
+
+        # Step 2: Get status for each sensor
+        sensors_status = []
+        connected_count = 0
+        streaming_count = 0
+        berthing_mode_count = 0
+
+        for sensor_id in sensor_ids:
+            sensor_status = {
+                "sensor_id": sensor_id,
+                "laser_info": laser_info.get(sensor_id, {}),
+                "connection_status": "disconnected",
+                "streaming_status": False,
+                "berthing_mode_active": False,
+                "sensor_info": None,
+                "center_stats": None,
+                "last_sync_timestamp": None
+            }
+
+            # Check if sensor is connected
+            if sensor_id in lidar_manager.sensors:
+                connected_count += 1
+                sensor_status["connection_status"] = "connected"
+
+                # Get sensor info if available
+                sensor_info = lidar_manager.get_sensor_info(sensor_id)
+                if sensor_info:
+                    sensor_status["sensor_info"] = sensor_info.dict() if hasattr(sensor_info, 'dict') else sensor_info
+
+                # Check if sensor is streaming
+                if lidar_manager.stream_active.get(sensor_id, False):
+                    streaming_count += 1
+                    sensor_status["streaming_status"] = True
+
+                # Check if sensor is in berthing mode
+                if sensor_id in lidar_manager.berthing_mode_sensors:
+                    berthing_mode_count += 1
+                    sensor_status["berthing_mode_active"] = True
+
+                    # Get center stats if available
+                    if sensor_id in lidar_manager.berthing_mode_center_stats:
+                        sensor_status["center_stats"] = lidar_manager.berthing_mode_center_stats[sensor_id]
+
+                # Get latest sync timestamp
+                if sensor_id in lidar_manager.sensor_sync_data:
+                    sensor_status["last_sync_timestamp"] = lidar_manager.sensor_sync_data[sensor_id].get("last_collection_time")
+
+            sensors_status.append(sensor_status)
+
+        # Step 3: Return comprehensive status
+        result = {
+            "success": True,
+            "berth_id": berth_id,
+            "message": f"Retrieved status for {len(sensor_ids)} sensors in berth {berth_id}",
+            "sensors": sensors_status,
+            "sensor_count": len(sensor_ids),
+            "connected_count": connected_count,
+            "streaming_count": streaming_count,
+            "berthing_mode_count": berthing_mode_count,
+            "berthing_mode_active": lidar_manager.berthing_mode_active,
+            "sync_coordinator_active": lidar_manager.sync_coordinator_active,
+            "last_global_sync_timestamp": lidar_manager.last_sync_timestamp
+        }
+
+        logger.info(f"Successfully retrieved sensor status for berth {berth_id}: {len(sensor_ids)} sensors, {connected_count} connected, {streaming_count} streaming")
+        return result
+
+    except httpx.RequestError as req_err:
+        logger.exception(f"Network error querying lasers for berth {berth_id}: {req_err}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database connection error for berth {berth_id}: {str(req_err)}"
+        )
+    except httpx.HTTPStatusError as http_err:
+        logger.exception(f"PostgREST error querying lasers for berth {berth_id}: {http_err.response.status_code} - {http_err.response.text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Database query error for berth {berth_id}: {http_err.response.status_code}"
+        )
+    except Exception as e:
+        logger.error(f"Error getting sensor status for berth {berth_id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error getting sensor status for berth {berth_id}: {str(e)}"
+        )
+
+
 @router.post("/berth/{berth_id}/deactivate", response_model=Dict[str, Any])
 async def deactivate_berthing_by_berth(berth_id: int):
     """
