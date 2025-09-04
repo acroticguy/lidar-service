@@ -74,7 +74,7 @@ class OperationResponse(BaseModel):
 
 class BerthingModeRequest(BaseModel):
     sensor_ids: List[str] = Field(..., description="List of sensor IDs to include in berthing mode")
-    computer_ip: Optional[str] = Field("192.168.1.50", description="Computer IP address for discovery and connect")
+    computer_ip: Optional[str] = Field(None, description="Computer IP address for discovery and connect")
 
 
 class BerthingModeResponse(BaseModel):

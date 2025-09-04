@@ -55,6 +55,9 @@ class LidarManager:
         self.raw_captures: Dict[str, RawLidarCapture] = {}  # High-speed capture
         self.lock = threading.Lock()
         self.use_direct_control = True  # Flag to use direct control instead of OpenPyLivox
+
+        # Fetch local IP once during initialization
+        self.local_ip = self._get_local_ip()
         
         # Berthing mode state
         self.berthing_mode_active: bool = False
@@ -80,25 +83,37 @@ class LidarManager:
         
         logger.info("LidarManager initialized with direct control enabled")
 
+    def _get_local_ip(self) -> str:
+        """Get the local IP address of this machine"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Doesn't actually connect, but forces a lookup for an outbound interface
+            s.connect(('10.255.255.255', 1))  # Connect to an unreachable address
+            IP = s.getsockname()[0]
+        except Exception:
+            # Fallback for when the above fails (e.g., no network route)
+            IP = '127.0.0.1'  # Or raise an error
+            # Try to iterate through common interfaces if the above fails
+            try:
+                # Get a list of interfaces that are not loopback
+                for interface in socket.gethostbyname_ex(socket.gethostname())[2]:
+                    if not interface.startswith('127.'):
+                        IP = interface
+                        break
+            except socket.gaierror:
+                pass  # Still couldn't find it
+        finally:
+            s.close()
+        return IP
+
     async def discover_sensors(
         self,
         computer_ip: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """Discover available Livox sensors on the network and return both
         discovered and connected sensors"""
-        def get_local_ip():
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect(('10.255.255.255', 1))
-                IP = s.getsockname()[0]
-            except Exception:
-                IP = '127.0.0.1'
-            finally:
-                s.close()
-            return IP
-
         def do_discover():
-            ip_to_use = computer_ip or get_local_ip()
+            ip_to_use = computer_ip or self.local_ip
             logger.info(f"Attempting discovery on IP: {ip_to_use}")
             temp_sensor = opl.openpylivox(showMessages=True)
 
@@ -314,11 +329,11 @@ class LidarManager:
             s.close()
         
         computer_ip = computer_ip or IP
-        
+
         if not computer_ip:
-            # Use the IP that works with the sensor network
-            computer_ip = '192.168.1.50' # Fallback
-            logger.info(f"Using configured computer IP: {computer_ip}")
+            # Use the local IP that was fetched during initialization
+            computer_ip = self.local_ip
+            logger.info(f"Using local IP: {computer_ip}")
 
         def do_auto_connect():
             nonlocal connected_count
@@ -337,6 +352,7 @@ class LidarManager:
 
                     # Check if we already connected this sensor
                     if sensor_id in self.sensors or sensor_id in already_connected_ids:
+                        logger.debug(f"Sensor {sensor_id} already connected, skipping")
                         sensor.disconnect()
                         # Continue looking for more sensors
                         continue
@@ -2139,7 +2155,7 @@ class LidarManager:
                                     logger.critical(f"[START] Connection attempt {connection_attempts + 1} for {sensor_id}")
                                     connection_success = await self.connect_sensor(
                                         sensor_id=sensor_id,
-                                        computer_ip=computer_ip or "192.168.1.50",
+                                        computer_ip=computer_ip or self.local_ip,
                                         sensor_ip=sensor_info['ip'],
                                         data_port=data_port,
                                         cmd_port=cmd_port,
