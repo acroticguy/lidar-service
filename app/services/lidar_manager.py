@@ -2123,28 +2123,208 @@ class LidarManager:
         """Get information about a specific sensor"""
         return self.sensor_info.get(sensor_id)
 
+    async def _enable_single_sensor_berthing(self, sensor_id: str, sensor_network_info: Dict, sensor_index: int, computer_ip: Optional[str]) -> Dict[str, Any]:
+        """Process a single sensor for berthing mode enablement concurrently"""
+        logger.critical(f"[START] Processing ENABLE for sensor {sensor_id}")
+
+        result = {
+            "sensor_id": sensor_id,
+            "connected": False,
+            "streaming": False,
+            "network_issues": False,
+            "error": None
+        }
+
+        try:
+            # Check if already connected
+            already_connected = sensor_id in self.sensors
+
+            if already_connected:
+                logger.info(f"[OK] Sensor {sensor_id} already connected")
+                result["connected"] = True
+            else:
+                # Find sensor network info
+                sensor_info = sensor_network_info.get(sensor_id)
+                if not sensor_info:
+                    logger.error(f"[ERROR] Sensor {sensor_id} not found in discovery - using fallback config")
+                    # Try fallback from config if available
+                    try:
+                        from ...core.config import settings
+                        if hasattr(settings, 'SENSORS'):
+                            fallback_sensor = next((s for s in settings.SENSORS if s.get('id') == sensor_id), None)
+                            if fallback_sensor:
+                                sensor_info = {
+                                    'sensor_id': sensor_id,
+                                    'ip': fallback_sensor.get('ip'),
+                                    'device_type': 'Tele-15',
+                                    'serialNumber': sensor_id
+                                }
+                                logger.info(f"[OK] Using fallback config for {sensor_id}: {sensor_info['ip']}")
+                    except Exception as fallback_err:
+                        logger.error(f"[ERROR] Fallback config failed for {sensor_id}: {fallback_err}")
+
+                if sensor_info:
+                    # Dynamic port assignment based on sensor index
+                    base_port = 65000 + (sensor_index * 10)  # 65000, 65010, 65020, etc.
+
+                    data_port = base_port
+                    cmd_port = base_port + 1
+                    imu_port = base_port + 2 if sensor_info.get('device_type') == 'Tele-15' else None
+
+                    logger.info(f"[START] Assigning ports to {sensor_id}: data={data_port}, cmd={cmd_port}, imu={imu_port}")
+
+                    # CRITICAL: Connection with retry mechanism
+                    connection_attempts = 0
+                    max_connection_attempts = 3
+                    connection_success = False
+
+                    while connection_attempts < max_connection_attempts and not connection_success:
+                        try:
+                            logger.critical(f"[START] Connection attempt {connection_attempts + 1} for {sensor_id}")
+                            connection_success = await self.connect_sensor(
+                                sensor_id=sensor_id,
+                                computer_ip=computer_ip or self.local_ip,
+                                sensor_ip=sensor_info['ip'],
+                                data_port=data_port,
+                                cmd_port=cmd_port,
+                                imu_port=imu_port
+                            )
+
+                            if connection_success:
+                                result["connected"] = True
+                                logger.info(f"[OK] Connected to sensor {sensor_id}")
+
+                                # CRITICAL: Verify hardware connection by sending test command
+                                try:
+                                    sensor = self.sensors[sensor_id]
+                                    if hasattr(sensor, '_cmdSocket') and sensor._cmdSocket:
+                                        logger.critical(f"[START] Verifying hardware connection for {sensor_id}")
+                                        # Send a ping-like command to verify connection
+                                        sensor._cmdSocket.sendto(sensor._CMD_GET_DEVICE_INFO, (sensor._sensorIP, 65000))
+                                        logger.info(f"[OK] Hardware connection verified for {sensor_id}")
+                                    else:
+                                        logger.warning(f"[WARN] No command socket for hardware verification {sensor_id}")
+                                except Exception as hw_verify_err:
+                                    logger.error(f"[ERROR] Hardware verification failed for {sensor_id}: {hw_verify_err}")
+                                    result["network_issues"] = True
+
+                                # Set default extrinsic parameters for berthing if not set
+                                try:
+                                    current_params = self.sensor_info[sensor_id].extrinsic_parameters
+                                    if (current_params and
+                                        current_params.x == 0.0 and current_params.y == 0.0 and current_params.z == 0.0):
+                                        # Set default berthing position (can be customized per installation)
+                                        default_params = ExtrinsicParameters(
+                                            x=0.0,    # Sensor at vessel center point
+                                            y=0.0,    # No starboard/port offset
+                                            z=2.0,    # 2m above deck level
+                                            roll=0.0, pitch=0.0, yaw=0.0  # Level mounting
+                                        )
+                                        await self.set_extrinsic_parameters(sensor_id, default_params)
+                                        logger.info(f"Set default extrinsic parameters for berthing sensor {sensor_id}")
+                                except Exception as e:
+                                    logger.debug(f"Could not set default extrinsics for {sensor_id}: {e}")
+                                break
+                            else:
+                                connection_attempts += 1
+                                if connection_attempts < max_connection_attempts:
+                                    logger.warning(f"[WARN] Connection failed, retry {connection_attempts}/{max_connection_attempts} for {sensor_id}")
+                                    await asyncio.sleep(2.0)
+
+                        except Exception as conn_err:
+                            connection_attempts += 1
+                            logger.error(f"[ERROR] Connection attempt {connection_attempts} failed for {sensor_id}: {conn_err}")
+                            if connection_attempts < max_connection_attempts:
+                                await asyncio.sleep(2.0)
+
+                    if not connection_success:
+                        logger.error(f"[ERROR] All connection attempts failed for sensor {sensor_id}")
+                        result["error"] = "connection_failed"
+                else:
+                    logger.error(f"[ERROR] No network info available for sensor {sensor_id}")
+                    result["error"] = "no_network_info"
+
+            # Step 4: AGGRESSIVELY start data streaming for connected sensor
+            if result["connected"]:
+                logger.critical(f"[START] Starting data streaming for {sensor_id}")
+
+                # Multiple streaming attempts
+                streaming_attempts = 0
+                max_streaming_attempts = 3
+                streaming_success = False
+
+                while streaming_attempts < max_streaming_attempts and not streaming_success:
+                    try:
+                        logger.critical(f"[START] Streaming attempt {streaming_attempts + 1} for {sensor_id}")
+                        streaming_success = await self.start_data_stream(sensor_id)
+
+                        if streaming_success:
+                            result["streaming"] = True
+                            logger.info(f"[OK] Started streaming for sensor {sensor_id}")
+
+                            # CRITICAL: Verify data is actually flowing by sending direct command
+                            try:
+                                sensor = self.sensors[sensor_id]
+                                if hasattr(sensor, '_cmdSocket') and sensor._cmdSocket:
+                                    logger.critical(f"[START] Sending START commands to hardware {sensor_id}")
+                                    # Send start data command directly to ensure hardware is active
+                                    sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (sensor._sensorIP, 65000))
+                                    logger.info(f"[OK] Sent DATA_START to hardware {sensor_id}")
+
+                                    # Wait brief moment and send spin up if needed
+                                    await asyncio.sleep(0.5)
+                                    sensor._cmdSocket.sendto(sensor._CMD_LIDAR_SPIN_UP, (sensor._sensorIP, 65000))
+                                    logger.info(f"[OK] Sent SPIN_UP to hardware {sensor_id}")
+                                else:
+                                    logger.warning(f"[WARN] No command socket for hardware start verification {sensor_id}")
+                            except Exception as hw_start_err:
+                                logger.error(f"[ERROR] Hardware start verification failed for {sensor_id}: {hw_start_err}")
+                                result["network_issues"] = True
+                            break
+                        else:
+                            streaming_attempts += 1
+                            if streaming_attempts < max_streaming_attempts:
+                                logger.warning(f"[WARN] Streaming failed, retry {streaming_attempts}/{max_streaming_attempts} for {sensor_id}")
+                                await asyncio.sleep(2.0)
+
+                    except Exception as stream_err:
+                        streaming_attempts += 1
+                        logger.error(f"[ERROR] Streaming attempt {streaming_attempts} failed for {sensor_id}: {stream_err}")
+                        if streaming_attempts < max_streaming_attempts:
+                            await asyncio.sleep(2.0)
+
+                if not streaming_success:
+                    logger.error(f"[ERROR] All streaming attempts failed for sensor {sensor_id}")
+                    result["error"] = "streaming_failed"
+
+        except Exception as sensor_error:
+            logger.error(f"[ERROR] Critical error processing sensor {sensor_id}: {sensor_error}")
+            result["error"] = str(sensor_error)
+
+        return result
+
     async def enable_berthing_mode(self, sensor_ids: List[str], computer_ip: Optional[str] = None) -> Dict[str, Any]:
         """CRITICAL: Enable berthing mode - ENSURES hardware actually starts even with network issues"""
         logger.critical(f"[START] CRITICAL: Enabling berthing mode for sensors: {sensor_ids}")
-        
+
         connected_sensors = []
         streaming_sensors = []
         failed_sensors = []
         network_issues = []
-        
+
         try:
             # Step 1: FORCE berthing mode state activation FIRST
             logger.critical("[START] FORCE setting berthing mode state")
             self.berthing_mode_active = True
             self.berthing_mode_sensors = sensor_ids.copy()
             self.berthing_mode_center_stats = {}
-            
+
             # Step 2: Discover sensors with retry mechanism
             logger.critical("[START] Discovering sensors with network reliability checks")
             discovered_sensors = []
             discovery_attempts = 0
             max_discovery_attempts = 3
-            
+
             while discovery_attempts < max_discovery_attempts and not discovered_sensors:
                 try:
                     discovered_sensors = await self.discover_sensors(computer_ip)
@@ -2161,182 +2341,42 @@ class LidarManager:
                     logger.error(f"[ERROR] Discovery attempt {discovery_attempts} failed: {disc_err}")
                     if discovery_attempts < max_discovery_attempts:
                         await asyncio.sleep(2.0)
-            
+
             sensor_network_info = {s.get('sensor_id', s.get('serialNumber')): s for s in discovered_sensors}
-            
-            # Step 3: AGGRESSIVELY connect and stream each specified sensor
-            for sensor_id in sensor_ids:
-                logger.critical(f"[START] Processing ENABLE for sensor {sensor_id}")
-                
-                try:
-                    # Check if already connected
-                    already_connected = sensor_id in self.sensors
-                    
-                    if already_connected:
-                        logger.info(f"[OK] Sensor {sensor_id} already connected")
-                        connected_sensors.append(sensor_id)
-                    else:
-                        # Find sensor network info
-                        sensor_info = sensor_network_info.get(sensor_id)
-                        if not sensor_info:
-                            logger.error(f"[ERROR] Sensor {sensor_id} not found in discovery - using fallback config")
-                            # Try fallback from config if available
-                            try:
-                                from ...core.config import settings
-                                if hasattr(settings, 'SENSORS'):
-                                    fallback_sensor = next((s for s in settings.SENSORS if s.get('id') == sensor_id), None)
-                                    if fallback_sensor:
-                                        sensor_info = {
-                                            'sensor_id': sensor_id,
-                                            'ip': fallback_sensor.get('ip'),
-                                            'device_type': 'Tele-15',
-                                            'serialNumber': sensor_id
-                                        }
-                                        logger.info(f"[OK] Using fallback config for {sensor_id}: {sensor_info['ip']}")
-                            except Exception as fallback_err:
-                                logger.error(f"[ERROR] Fallback config failed for {sensor_id}: {fallback_err}")
-                        
-                        if sensor_info:
-                            # Dynamic port assignment based on sensor index
-                            sensor_index = sensor_ids.index(sensor_id)
-                            base_port = 65000 + (sensor_index * 10)  # 65000, 65010, 65020, etc.
-                            
-                            data_port = base_port
-                            cmd_port = base_port + 1
-                            imu_port = base_port + 2 if sensor_info.get('device_type') == 'Tele-15' else None
-                            
-                            logger.info(f"[START] Assigning ports to {sensor_id}: data={data_port}, cmd={cmd_port}, imu={imu_port}")
-                            
-                            # CRITICAL: Connection with retry mechanism
-                            connection_attempts = 0
-                            max_connection_attempts = 3
-                            connection_success = False
-                            
-                            while connection_attempts < max_connection_attempts and not connection_success:
-                                try:
-                                    logger.critical(f"[START] Connection attempt {connection_attempts + 1} for {sensor_id}")
-                                    connection_success = await self.connect_sensor(
-                                        sensor_id=sensor_id,
-                                        computer_ip=computer_ip or self.local_ip,
-                                        sensor_ip=sensor_info['ip'],
-                                        data_port=data_port,
-                                        cmd_port=cmd_port,
-                                        imu_port=imu_port
-                                    )
-                                    
-                                    if connection_success:
-                                        connected_sensors.append(sensor_id)
-                                        logger.info(f"[OK] Connected to sensor {sensor_id}")
-                                        
-                                        # CRITICAL: Verify hardware connection by sending test command
-                                        try:
-                                            sensor = self.sensors[sensor_id]
-                                            if hasattr(sensor, '_cmdSocket') and sensor._cmdSocket:
-                                                logger.critical(f"[START] Verifying hardware connection for {sensor_id}")
-                                                # Send a ping-like command to verify connection
-                                                sensor._cmdSocket.sendto(sensor._CMD_GET_DEVICE_INFO, (sensor._sensorIP, 65000))
-                                                logger.info(f"[OK] Hardware connection verified for {sensor_id}")
-                                            else:
-                                                logger.warning(f"[WARN] No command socket for hardware verification {sensor_id}")
-                                        except Exception as hw_verify_err:
-                                            logger.error(f"[ERROR] Hardware verification failed for {sensor_id}: {hw_verify_err}")
-                                            network_issues.append(sensor_id)
-                                
-                                        # Set default extrinsic parameters for berthing if not set
-                                        try:
-                                            current_params = self.sensor_info[sensor_id].extrinsic_parameters
-                                            if (current_params and 
-                                                current_params.x == 0.0 and current_params.y == 0.0 and current_params.z == 0.0):
-                                                # Set default berthing position (can be customized per installation)
-                                                default_params = ExtrinsicParameters(
-                                                    x=0.0,    # Sensor at vessel center point
-                                                    y=0.0,    # No starboard/port offset
-                                                    z=2.0,    # 2m above deck level
-                                                    roll=0.0, pitch=0.0, yaw=0.0  # Level mounting
-                                                )
-                                                await self.set_extrinsic_parameters(sensor_id, default_params)
-                                                logger.info(f"Set default extrinsic parameters for berthing sensor {sensor_id}")
-                                        except Exception as e:
-                                            logger.debug(f"Could not set default extrinsics for {sensor_id}: {e}")
-                                        break
-                                    else:
-                                        connection_attempts += 1
-                                        if connection_attempts < max_connection_attempts:
-                                            logger.warning(f"[WARN] Connection failed, retry {connection_attempts}/{max_connection_attempts} for {sensor_id}")
-                                            await asyncio.sleep(2.0)
-                                        
-                                except Exception as conn_err:
-                                    connection_attempts += 1
-                                    logger.error(f"[ERROR] Connection attempt {connection_attempts} failed for {sensor_id}: {conn_err}")
-                                    if connection_attempts < max_connection_attempts:
-                                        await asyncio.sleep(2.0)
-                            
-                            if not connection_success:
-                                logger.error(f"[ERROR] All connection attempts failed for sensor {sensor_id}")
-                                failed_sensors.append(sensor_id)
-                        else:
-                            logger.error(f"[ERROR] No network info available for sensor {sensor_id}")
-                            failed_sensors.append(sensor_id)
-                    
-                    # Step 4: AGGRESSIVELY start data streaming for connected sensor
-                    if sensor_id in connected_sensors:
-                        logger.critical(f"[START] Starting data streaming for {sensor_id}")
-                        
-                        # Multiple streaming attempts
-                        streaming_attempts = 0
-                        max_streaming_attempts = 3
-                        streaming_success = False
-                        
-                        while streaming_attempts < max_streaming_attempts and not streaming_success:
-                            try:
-                                logger.critical(f"[START] Streaming attempt {streaming_attempts + 1} for {sensor_id}")
-                                streaming_success = await self.start_data_stream(sensor_id)
-                                
-                                if streaming_success:
-                                    streaming_sensors.append(sensor_id)
-                                    logger.info(f"[OK] Started streaming for sensor {sensor_id}")
-                                    
-                                    # CRITICAL: Verify data is actually flowing by sending direct command
-                                    try:
-                                        sensor = self.sensors[sensor_id]
-                                        if hasattr(sensor, '_cmdSocket') and sensor._cmdSocket:
-                                            logger.critical(f"[START] Sending START commands to hardware {sensor_id}")
-                                            # Send start data command directly to ensure hardware is active
-                                            sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (sensor._sensorIP, 65000))
-                                            logger.info(f"[OK] Sent DATA_START to hardware {sensor_id}")
-                                            
-                                            # Wait brief moment and send spin up if needed
-                                            await asyncio.sleep(0.5)
-                                            sensor._cmdSocket.sendto(sensor._CMD_LIDAR_SPIN_UP, (sensor._sensorIP, 65000))
-                                            logger.info(f"[OK] Sent SPIN_UP to hardware {sensor_id}")
-                                        else:
-                                            logger.warning(f"[WARN] No command socket for hardware start verification {sensor_id}")
-                                    except Exception as hw_start_err:
-                                        logger.error(f"[ERROR] Hardware start verification failed for {sensor_id}: {hw_start_err}")
-                                        network_issues.append(sensor_id)
-                                    break
-                                else:
-                                    streaming_attempts += 1
-                                    if streaming_attempts < max_streaming_attempts:
-                                        logger.warning(f"[WARN] Streaming failed, retry {streaming_attempts}/{max_streaming_attempts} for {sensor_id}")
-                                        await asyncio.sleep(2.0)
-                                        
-                            except Exception as stream_err:
-                                streaming_attempts += 1
-                                logger.error(f"[ERROR] Streaming attempt {streaming_attempts} failed for {sensor_id}: {stream_err}")
-                                if streaming_attempts < max_streaming_attempts:
-                                    await asyncio.sleep(2.0)
-                        
-                        if not streaming_success:
-                            logger.error(f"[ERROR] All streaming attempts failed for sensor {sensor_id}")
-                            # Remove from connected since streaming failed
-                            if sensor_id in connected_sensors:
-                                connected_sensors.remove(sensor_id)
-                            failed_sensors.append(sensor_id)
-                            
-                except Exception as sensor_error:
-                    logger.error(f"[ERROR] Critical error processing sensor {sensor_id}: {sensor_error}")
+
+            # Step 3: CONCURRENTLY connect and stream each specified sensor
+            logger.critical(f"[START] Processing {len(sensor_ids)} sensors CONCURRENTLY")
+
+            # Create concurrent tasks for all sensors
+            sensor_tasks = []
+            for i, sensor_id in enumerate(sensor_ids):
+                task = self._enable_single_sensor_berthing(sensor_id, sensor_network_info, i, computer_ip)
+                sensor_tasks.append(task)
+
+            # Execute all sensor tasks concurrently
+            sensor_results = await asyncio.gather(*sensor_tasks, return_exceptions=True)
+
+            # Process results
+            for i, result in enumerate(sensor_results):
+                sensor_id = sensor_ids[i]
+
+                if isinstance(result, Exception):
+                    logger.error(f"[ERROR] Exception in sensor {sensor_id}: {result}")
                     failed_sensors.append(sensor_id)
+                    continue
+
+                if result["connected"]:
+                    connected_sensors.append(sensor_id)
+
+                if result["streaming"]:
+                    streaming_sensors.append(sensor_id)
+
+                if result["network_issues"]:
+                    network_issues.append(sensor_id)
+
+                if result["error"]:
+                    failed_sensors.append(sensor_id)
+                    logger.error(f"[ERROR] Sensor {sensor_id} failed: {result['error']}")
             
             # Step 5: Start synchronization coordinator for all streaming sensors
             if streaming_sensors:
