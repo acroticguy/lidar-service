@@ -97,7 +97,7 @@ class DatabaseConsumer:
         """
         logger.info(f"Consumer for {sensor_id} ready to send data to PostgREST at {self.postgrest_url}.")
 
-        rpc_url = f"{self.postgrest_url}/rpc/nv_insert_laser_data"
+        rpc_url = f"{self.postgrest_url}/rpc/nv_insert_laser_data_serial"
         headers = {'Content-Type': 'application/json'}
         berthing_url = f"{self.fastapi_server}/berthing/data/sensor/{sensor_id}"
 
@@ -114,7 +114,6 @@ class DatabaseConsumer:
                 data = res
 
                 # Extract and prepare payload
-                laser_id = 22  # Hardcoded, consider making this dynamic if appropriate
                 # Use time.time() for current time if timestamp is missing, ensure UTC
                 dt_iso_format = datetime.fromtimestamp(data.get('timestamp', time.time()), tz=timezone.utc).isoformat()
                 distance = data.get('distance', 0.0)
@@ -126,7 +125,7 @@ class DatabaseConsumer:
                 logger.debug(f"Preparing to send data for sensor {sensor_id} at {dt_iso_format} to PostgREST.")
                 
                 payload = {
-                    "p_laser_id": laser_id,
+                    "p_serial": sensor_id,
                     "p_dt": dt_iso_format,
                     "p_distance": distance,
                     "p_speed": speed,

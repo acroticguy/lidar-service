@@ -38,6 +38,7 @@ from ..models.lidar import (
     LidarInfo, ExtrinsicParameters
 )
 from ..core.logging_config import logger
+from .fake_lidar import FakeLidarSimulator
 
 
 class LidarManager:
@@ -301,6 +302,63 @@ class LidarManager:
 
         except Exception as e:
             logger.error(f"Error connecting to sensor {sensor_id}: {str(e)}")
+    async def connect_fake_lidar(self, sensor_id: str, computer_ip: str, sensor_ip: str,
+                               data_port: int, cmd_port: int, imu_port: Optional[int] = None) -> bool:
+        """Connect to a fake lidar simulator"""
+        try:
+            with self.lock:
+                if sensor_id in self.sensors:
+                    logger.warning(f"Fake sensor {sensor_id} already connected")
+                    return False
+
+                # Create fake lidar simulator
+                fake_sensor = FakeLidarSimulator(showMessages=True)
+
+                # Connect the fake sensor
+                connected = fake_sensor.connect(computer_ip, sensor_ip, data_port, cmd_port, imu_port)
+
+                if connected:
+                    # Store the fake sensor
+                    self.sensors[sensor_id] = fake_sensor
+                    self.data_queues[sensor_id] = queue.Queue(maxsize=10000)
+                    self.command_queues[sensor_id] = queue.Queue(maxsize=100)
+                    self.stream_active[sensor_id] = False
+
+                    self.sensor_info[sensor_id] = LidarInfo(
+                        sensor_id=sensor_id,
+                        sensor_ip=sensor_ip,
+                        status=LidarStatus.CONNECTED,
+                        connection_parameters={
+                            "computer_ip": computer_ip,
+                            "sensor_ip": sensor_ip,
+                            "data_port": str(data_port),
+                            "cmd_port": str(cmd_port),
+                            "is_simulation": True
+                        }
+                    )
+
+                    # Set default extrinsic parameters
+                    try:
+                        default_params = ExtrinsicParameters(
+                            x=0.0, y=0.0, z=2.0,
+                            roll=0.0, pitch=0.0, yaw=0.0
+                        )
+                        await self.set_extrinsic_parameters(sensor_id, default_params)
+                        logger.info(f"Set default extrinsic parameters for fake sensor {sensor_id}")
+                    except Exception as e:
+                        logger.debug(f"Could not set extrinsics for fake sensor: {e}")
+
+                    await self._update_sensor_info(sensor_id)
+
+                    logger.info(f"Successfully connected to fake lidar {sensor_id}")
+                    return True
+                else:
+                    logger.error(f"Failed to connect fake lidar {sensor_id}")
+                    return False
+
+        except Exception as e:
+            logger.error(f"Error connecting fake lidar {sensor_id}: {str(e)}")
+            return False
             return False
 
     async def auto_connect_all(self, computer_ip: Optional[str] = None) -> int:
@@ -557,7 +615,8 @@ class LidarManager:
             try:
                 # Skip wait for idle to avoid socket buffer errors
                 # Just send the command directly
-                sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (sensor._sensorIP, 65000))
+                cmd_port = 65000  # Use the standard command port
+                sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (sensor._sensorIP, cmd_port))
                 sensor._isData = True
                 logger.info("Sent data start command successfully")
                 time.sleep(0.5)  # Give time for data to start flowing
@@ -779,6 +838,8 @@ class LidarManager:
                         if packets_received == 1:
                             logger.info(f"Receiving packets from {addr}")
                             logger.info(f"First packet size: {len(data)} bytes")
+                        elif packets_received <= 10:
+                            logger.info(f"Packet {packets_received} from {addr}, size: {len(data)} bytes")
 
                         # Log different packet sizes we see
                         if packets_received <= 5:
@@ -1269,6 +1330,11 @@ class LidarManager:
         logger.info(f"Synchronized UDP capture thread started for sensor {sensor_id}")
         sensor = self.sensors[sensor_id]
 
+        # Check if this is a fake sensor
+        is_fake = hasattr(sensor, '_is_simulation') and sensor._is_simulation
+        if is_fake:
+            logger.info(f"Sensor {sensor_id} is detected as fake lidar")
+
         # Get the data socket from OpenPyLivox
         if not hasattr(sensor, '_dataSocket') or not sensor._dataSocket:
             logger.error("No data socket available from OpenPyLivox")
@@ -1538,9 +1604,11 @@ class LidarManager:
                 for sensor_id, data in synchronized_data.items():
                     if "center_stats" in data:
                         self.berthing_mode_center_stats[sensor_id] = data["center_stats"]
+                        logger.info(f"Updated center stats for {sensor_id}: distance={data['center_stats'].get('stable_distance', 'N/A')}")
                     # Also update sensor_sync_data with the full synchronized data including center_stats
                     if sensor_id in self.sensor_sync_data:
                         self.sensor_sync_data[sensor_id].update(data)
+                        logger.info(f"Updated sensor_sync_data for {sensor_id}")
                 
                 # Put synchronized data into queues for each sensor
                 for sensor_id, data in synchronized_data.items():
@@ -1759,7 +1827,7 @@ class LidarManager:
         confidence = min(len(target_points) / 100.0, 1.0)  # Simple confidence
         
         # Log distance and speed for troubleshooting (debug level for production)
-        logger.debug(f"LASER RANGEFINDER {sensor_id}: Distance={final_distance:.3f}m, Speed={final_speed*1000:.1f}mm/s, "
+        logger.info(f"LASER RANGEFINDER {sensor_id}: Distance={final_distance:.3f}m, Speed={final_speed*1000:.1f}mm/s, "
                     f"Instant={instant_speed*1000:.1f}mm/s, SA_Avg={sa_averaged_speed*1000:.1f}mm/s, "
                     f"Points={len(target_points)}, Confidence={speed_confidence:.2f}")
         

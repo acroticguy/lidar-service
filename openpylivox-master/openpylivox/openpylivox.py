@@ -1683,58 +1683,82 @@ class openpylivox(object):
 
     def _searchForSensors(self, opt=False):
 
+        # Create broadcast socket to send discovery command
+        broadcastSock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        broadcastSock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        broadcastSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Create listening socket for responses
         serverSock_INIT = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         serverSock_INIT.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         serverSock_INIT.bind(("0.0.0.0", 55000))
-
-        foundDevice = select.select([serverSock_INIT], [], [], 1)[0]
 
         IPs = []
         Serials = []
         ipRangeCodes = []
         sensorTypes = []
 
-        if foundDevice:
+        # Send broadcast discovery command to port 65000
+        # This is the exact command the simulator expects
+        _CMD_BROADCAST_SEARCH = b'\xaa\x01\x0f\x00\x00\x00\x00\x04\xd7\x00\x02\xae\x8a\x8a\x7b'
+        try:
+            broadcastSock.sendto(_CMD_BROADCAST_SEARCH, ('<broadcast>', 65000))
+            if self._showMessages and opt:
+                print("   Sent discovery broadcast to port 65000")
+        except Exception as e:
+            if self._showMessages and opt:
+                print(f"   Warning: Could not send broadcast: {e}")
 
-            readData = True
-            while readData:
+        # Listen for responses with timeout
+        start_time = time.time()
+        timeout = 2.0  # 2 second timeout
 
-                binData, addr = serverSock_INIT.recvfrom(34)
+        while time.time() - start_time < timeout:
+            foundDevice = select.select([serverSock_INIT], [], [], 0.1)[0]
 
-                if len(addr) == 2:
-                    if addr[1] == 65000:
-                        if len(IPs) == 0:
-                            goodData, cmdMessage, dataMessage, device_serial, typeMessage, ipRangeCode = self._info(binData)
-                            sensorTypes.append(typeMessage)
-                            IPs.append(self._checkIP(addr[0]))
-                            Serials.append(device_serial)
-                            ipRangeCodes.append(ipRangeCode)
+            if foundDevice:
+                try:
+                    binData, addr = serverSock_INIT.recvfrom(34)
 
-                        else:
-                            existsAlready = False
-                            for i in range(0, len(IPs)):
-                                if addr[0] == IPs[i]:
-                                    existsAlready = True
-                            if existsAlready:
-                                readData = False
-                                break
-                            else:
+                    if len(addr) == 2:
+                        if addr[1] == 65000:
+                            if len(IPs) == 0:
                                 goodData, cmdMessage, dataMessage, device_serial, typeMessage, ipRangeCode = self._info(binData)
-                                sensorTypes.append(typeMessage)
-                                IPs.append(self._checkIP(addr[0]))
-                                Serials.append(device_serial)
-                                ipRangeCodes.append(ipRangeCode)
+                                if goodData:
+                                    sensorTypes.append(typeMessage)
+                                    IPs.append(self._checkIP(addr[0]))
+                                    Serials.append(device_serial)
+                                    ipRangeCodes.append(ipRangeCode)
+                                    if self._showMessages and opt:
+                                        print(f"   Found Livox Sensor w. serial #{device_serial} at IP: {addr[0]}")
 
-                else:
-                    readData = False
+                            else:
+                                existsAlready = False
+                                for i in range(0, len(IPs)):
+                                    if addr[0] == IPs[i]:
+                                        existsAlready = True
+                                if not existsAlready:
+                                    goodData, cmdMessage, dataMessage, device_serial, typeMessage, ipRangeCode = self._info(binData)
+                                    if goodData:
+                                        sensorTypes.append(typeMessage)
+                                        IPs.append(self._checkIP(addr[0]))
+                                        Serials.append(device_serial)
+                                        ipRangeCodes.append(ipRangeCode)
+                                        if self._showMessages and opt:
+                                            print(f"   Found additional Livox Sensor w. serial #{device_serial} at IP: {addr[0]}")
 
+                except Exception as e:
+                    if self._showMessages and opt:
+                        print(f"   Error receiving response: {e}")
+                    break
+
+        # Clean up sockets
+        broadcastSock.close()
         serverSock_INIT.close()
         time.sleep(0.2)
 
-        if self._showMessages and opt:
-            for i in range(0, len(IPs)):
-                print("   Found Livox Sensor w. serial #" + Serials[i] + " at IP: " + IPs[i])
-            print()
+        if self._showMessages and opt and len(IPs) == 0:
+            print("   No Livox sensors responded to discovery broadcast")
 
         return IPs, Serials, ipRangeCodes, sensorTypes
 
