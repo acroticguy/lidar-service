@@ -18,8 +18,6 @@ async def fetch_berthing_data_for_sensor(sensor_id: str) -> Dict[str, Any]:
     sync_data = lidar_manager.sensor_sync_data.get(sensor_id, {})
     center_stats = sync_data.get("center_stats", {})
 
-    logger.info(f"Fetching berthing data for {sensor_id}: sync_data keys={list(sync_data.keys())}, center_stats keys={list(center_stats.keys())}")
-
     # Extract essential data
     timestamp = sync_data.get("timestamp", 0)
     distance = center_stats.get("stable_distance", 0.0)

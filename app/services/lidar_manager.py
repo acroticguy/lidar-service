@@ -1604,7 +1604,6 @@ class LidarManager:
                 for sensor_id, data in synchronized_data.items():
                     if "center_stats" in data:
                         self.berthing_mode_center_stats[sensor_id] = data["center_stats"]
-                        logger.info(f"Updated center stats for {sensor_id}: distance={data['center_stats'].get('stable_distance', 'N/A')}")
                     # Also update sensor_sync_data with the full synchronized data including center_stats
                     if sensor_id in self.sensor_sync_data:
                         self.sensor_sync_data[sensor_id].update(data)
@@ -1825,11 +1824,6 @@ class LidarManager:
         final_distance = round(smooth_distance, 3)
         final_speed = round(speed_mps, 4)
         confidence = min(len(target_points) / 100.0, 1.0)  # Simple confidence
-        
-        # Log distance and speed for troubleshooting (debug level for production)
-        logger.info(f"LASER RANGEFINDER {sensor_id}: Distance={final_distance:.3f}m, Speed={final_speed*1000:.1f}mm/s, "
-                    f"Instant={instant_speed*1000:.1f}mm/s, SA_Avg={sa_averaged_speed*1000:.1f}mm/s, "
-                    f"Points={len(target_points)}, Confidence={speed_confidence:.2f}")
         
         # Ensure all values are JSON-safe (no infinity or NaN)
         def safe_float(value, default=0.0):
