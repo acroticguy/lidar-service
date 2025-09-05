@@ -27,7 +27,6 @@ def patched_init(self, showMessages=False):
 openpylivox.openpylivox.__init__ = patched_init
 
 import openpylivox as opl
-from .raw_lidar_capture import RawLidarCapture
 from .lidar_wrapper import LivoxSensorWrapper
 from .lidar_direct import DirectLidarController
 from .berthing_measurements import BerthingMeasurementSystem
@@ -53,7 +52,6 @@ class LidarManager:
         self.stream_active: Dict[str, bool] = {}
         self.imu_threads: Dict[str, threading.Thread] = {}  # IMU capture threads
         self.latest_imu_data: Dict[str, dict] = {}  # Store latest IMU data per sensor
-        self.raw_captures: Dict[str, RawLidarCapture] = {}  # High-speed capture
         self.lock = threading.Lock()
         self.use_direct_control = True  # Flag to use direct control instead of OpenPyLivox
 
@@ -359,34 +357,12 @@ class LidarManager:
         except Exception as e:
             logger.error(f"Error connecting fake lidar {sensor_id}: {str(e)}")
             return False
-            return False
 
     async def auto_connect_all(self, computer_ip: Optional[str] = None) -> int:
         """Auto-connect to all available sensors"""
         connected_count = 0
 
-        # Attempt getting local IP if not provided
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            # Doesn't actually connect, but forces a lookup for an outbound interface
-            s.connect(('10.255.255.255', 1)) # Connect to an unreachable address
-            IP = s.getsockname()[0]
-        except Exception:
-            # Fallback for when the above fails (e.g., no network route)
-            IP = '127.0.0.1' # Or raise an error
-            # Try to iterate through common interfaces if the above fails
-            try:
-                # Get a list of interfaces that are not loopback
-                for interface in socket.gethostbyname_ex(socket.gethostname())[2]:
-                    if not interface.startswith('127.'):
-                        IP = interface
-                        break
-            except socket.gaierror:
-                pass # Still couldn't find it
-        finally:
-            s.close()
-        
-        computer_ip = computer_ip or IP
+        computer_ip = computer_ip or self.local_ip
 
         if not computer_ip:
             # Use the local IP that was fetched during initialization
@@ -682,13 +658,7 @@ class LidarManager:
             # Wait a bit for the thread to notice
             await asyncio.sleep(0.1)
 
-            # Stop raw capture if exists
-            if sensor_id in self.raw_captures:
-                try:
-                    self.raw_captures[sensor_id].stop_capture()
-                    del self.raw_captures[sensor_id]
-                except Exception as e:
-                    logger.debug(f"Error stopping raw capture: {e}")
+            # Raw capture functionality removed during cleanup
 
             # Get sensor reference
             sensor = self.sensors[sensor_id]
@@ -801,8 +771,7 @@ class LidarManager:
         POSITION_MEMORY = 50       # Remember last 50 good positions
 
         # Center detection tolerances - much more practical for vessel berthing
-        MAX_Y_TOLERANCE = 0.050  # 5cm tolerance in Y axis (practical for vessel berthing)
-        MAX_Z_TOLERANCE = 0.050  # 5cm tolerance in Z axis (practical for vessel berthing)
+        CENTER_TOLERANCE = 0.050  # 5cm tolerance in Y and Z axes (practical for vessel berthing)
 
         # The "perfect" center position (will be learned)
         best_y_position = 0.0
@@ -836,14 +805,14 @@ class LidarManager:
 
                         # Log packet source for debugging
                         if packets_received == 1:
-                            logger.info(f"Receiving packets from {addr}")
-                            logger.info(f"First packet size: {len(data)} bytes")
+                            logger.debug(f"Receiving packets from {addr}")
+                            logger.debug(f"First packet size: {len(data)} bytes")
                         elif packets_received <= 10:
-                            logger.info(f"Packet {packets_received} from {addr}, size: {len(data)} bytes")
+                            logger.debug(f"Packet {packets_received} from {addr}, size: {len(data)} bytes")
 
                         # Log different packet sizes we see
                         if packets_received <= 5:
-                            logger.info(f"Packet {packets_received}: size={len(data)} bytes")
+                            logger.debug(f"Packet {packets_received}: size={len(data)} bytes")
 
                         # Parse Livox packet based on OpenPyLivox structure
                         # Packet structure:
@@ -868,13 +837,13 @@ class LidarManager:
 
                             # Log packet structure
                             if packets_received <= 5:
-                                logger.info(f"Packet structure: version={version}, data_type={data_type}")
+                                logger.debug(f"Packet structure: version={version}, data_type={data_type}")
                                 # Log first few data values to debug
                                 if len(data) >= 30:
                                     test_x = struct.unpack('<i', data[18:22])[0]
                                     test_y = struct.unpack('<i', data[22:26])[0]
                                     test_z = struct.unpack('<i', data[26:30])[0]
-                                    logger.info(f"First point raw values: x={test_x}, y={test_y}, z={test_z}")
+                                    logger.debug(f"First point raw values: x={test_x}, y={test_y}, z={test_z}")
 
                             # Handle different data types
                             if version == 5 and data_type == 0:  # Version 5, Cartesian single return (Mid-40/100)
@@ -959,7 +928,7 @@ class LidarManager:
 
                                 # Log parsing success for first few packets
                                 if packets_this_second < 5 and points_in_packet > 0:
-                                    logger.info(f"Tele-15 single return packet had {points_in_packet} valid points")
+                                    logger.debug(f"Tele-15 single return packet had {points_in_packet} valid points")
 
                             elif version == 5 and data_type == 4:  # Tele-15 Cartesian dual return
                                 # Parse 48 points with dual return (28 bytes each)
@@ -1029,16 +998,16 @@ class LidarManager:
 
                                 # Log parsing success for first few packets
                                 if packets_this_second < 5 and points_in_packet > 0:
-                                    logger.info(f"Dual return packet had {points_in_packet} valid points")
+                                    logger.debug(f"Dual return packet had {points_in_packet} valid points")
 
                             else:
                                 # Log unhandled packet types
                                 if packets_received <= 10:
-                                    logger.warning(f"Unhandled packet type: version={version}, data_type={data_type}, size={len(data)}")
+                                    logger.debug(f"Unhandled packet type: version={version}, data_type={data_type}, size={len(data)}")
 
                                 # Try alternative parsing for smaller packets
                                 if len(data) >= 1214 and packets_received <= 10:  # Slightly smaller packet
-                                    logger.info(f"Trying alternative parsing for packet size {len(data)}")
+                                    logger.debug(f"Trying alternative parsing for packet size {len(data)}")
                                     # The packet might not have the full header, try direct point parsing
                                     # Livox packets might start data at different offsets
                                     for start_offset in [0, 14, 18, 42, 60]:
@@ -1046,7 +1015,7 @@ class LidarManager:
                                             # Try to parse first point to validate offset
                                             test_y = struct.unpack('<i', data[start_offset+4:start_offset+8])[0] if start_offset + 8 <= len(data) else 0
                                             if test_y != 0 and -500000 <= test_y <= 500000:
-                                                logger.info(f"Found valid data at offset {start_offset}, Y={test_y}")
+                                                logger.debug(f"Found valid data at offset {start_offset}, Y={test_y}")
                                                 # Parse points from this offset
                                                 byte_pos = start_offset
                                                 for i in range(100):
@@ -1110,11 +1079,11 @@ class LidarManager:
                         current_distance = trimmed_distances[len(trimmed_distances) // 2]  # Median of trimmed data
 
                         # Find all points that contribute to this primary target
-                        target_tolerance = 0.1  # 10cm tolerance around primary distance
+                        TARGET_DISTANCE_TOLERANCE = 0.1  # 10cm tolerance around primary distance
                         target_points = []
 
                         for point in point_cloud_data:
-                            if abs(point["distance"] - current_distance) <= target_tolerance:
+                            if abs(point["distance"] - current_distance) <= TARGET_DISTANCE_TOLERANCE:
                                 target_points.append({
                                     "x": point["x"],
                                     "y": point["y"],
@@ -1160,14 +1129,14 @@ class LidarManager:
 
                 # Always log what happened this second
                 if packets_this_second == 0:
-                    logger.warning(f"No packets received in this second on port {data_port}")
+                    logger.warning(f"No packets received in this second on port {sock.getsockname()[1]}")
                 else:
                     logger.info(f"Captured {packets_this_second} packets, {len(point_cloud_data)} valid points in this second")
 
                 # Log cumulative statistics
                 if time.time() - last_log > 5.0:
                     if packets_received == 0:
-                        logger.warning(f"Still no packets received on port {data_port} after {int(time.time() - start_time)} seconds")
+                        logger.warning(f"Still no packets received on port {sock.getsockname()[1]} after {int(time.time() - start_time)} seconds")
                     else:
                         logger.info(f"UDP capture total: {packets_received} packets, {points_parsed} points total")
                     last_log = time.time()
@@ -1703,7 +1672,7 @@ class LidarManager:
             if 0.5 < x <= 50.0:  # Reasonable distance range
                 # Calculate radial distance from laser optical axis (center beam)
                 radial_distance = (y*y + z*z)**0.5
-                
+
                 # PRECISION beam filter - find TRUE center beam
                 # Use dynamic tolerance for laser optical axis
                 if radial_distance <= CENTER_TOLERANCE:
@@ -1718,11 +1687,12 @@ class LidarManager:
         # FALLBACK: If no center beam points found, expand search slightly
         if len(target_points) == 0:
             logger.debug(f"No center beam points found, expanding search for sensor {sensor_id}")
+            EXPANDED_TOLERANCE = CENTER_TOLERANCE * 1.6  # Expanded tolerance (1.6x normal)
             for point in points:
                 x, y, z = point["x"], point["y"], point["z"]
                 if 0.5 < x <= 50.0:  # Reasonable distance range
                     radial_distance = (y*y + z*z)**0.5
-                    if radial_distance <= CENTER_TOLERANCE * 1.6:  # Expanded tolerance (1.6x normal)
+                    if radial_distance <= EXPANDED_TOLERANCE:
                         ldm302_distance = x + LDM302_CALIBRATION_OFFSET
                         target_points.append({
                             "distance": ldm302_distance,
@@ -2491,9 +2461,9 @@ class LidarManager:
                                 # Wait a moment
                                 await asyncio.sleep(0.5)
                                 
-                                # Send spin down command
+                                # Send spin down command using high-level API
                                 try:
-                                    sensor._cmdSocket.sendto(sensor._CMD_LIDAR_SPIN_DOWN, (sensor._sensorIP, 65000))
+                                    sensor.lidarSpinDown()
                                     logger.info(f"[OK] Sent SPIN_DOWN to {sensor_id}")
                                 except Exception as cmd_err:
                                     logger.error(f"[ERROR] Failed to send SPIN_DOWN to {sensor_id}: {cmd_err}")
