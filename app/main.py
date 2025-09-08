@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from .core.config import settings
 from .core.logging_config import logger
-from .api.endpoints import connection, control, streaming, websocket, berthing_calibration, calibration_adjust, precision_config, berthing_data
+from .api.endpoints import connection, control, streaming, websocket, berthing_calibration, calibration_adjust, precision_config, berthing_data, modbus
 from .api.middleware.logging_middleware import LoggingMiddleware
 from .api.middleware.error_handler import (
     http_exception_handler,
@@ -100,6 +100,7 @@ app.include_router(berthing_calibration.router, prefix="/api/v1/berthing")
 app.include_router(calibration_adjust.router, prefix="/api/v1/calibration")
 app.include_router(precision_config.router, prefix="/api/v1/precision")
 app.include_router(berthing_data.router, prefix="/api/v1/berthing/data")
+app.include_router(modbus.router, prefix="/api/v1")
 
 
 @app.get("/")
