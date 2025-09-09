@@ -43,7 +43,11 @@ async def fetch_berthing_data_for_sensor(sensor_id: str) -> Dict[str, Any]:
     else:
         direction = "stationary"
     
-    return {
+    # Get laser info including name_for_pager if available
+    laser_info = lidar_manager.berthing_mode_laser_info.get(sensor_id, {})
+    name_for_pager = laser_info.get('name_for_pager')
+
+    result = {
         "sensor_id": sensor_id,
         "timestamp": timestamp,
         "distance": round(distance, 3),
@@ -63,6 +67,12 @@ async def fetch_berthing_data_for_sensor(sensor_id: str) -> Dict[str, Any]:
         "stable_distance": round(distance, 3),
         "status": "active"
     }
+
+    # Include name_for_pager if available
+    if name_for_pager:
+        result["name_for_pager"] = name_for_pager
+
+    return result
     
 async def get_all_berthing_data_core() -> Dict[str, Any]:
     """

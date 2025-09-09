@@ -338,6 +338,7 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
 
     # Query database to get sensors for this berth
     berth_sensors = []
+    sensor_laser_info = {}
     try:
         postgrest_url = f"{settings.DB_HOST}/rpc/get_lasers_by_berth"
         headers = {'Content-Type': 'application/json'}
@@ -348,11 +349,12 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
             response.raise_for_status()
             laser_data = response.json()
 
-        # Extract sensor IDs
+        # Extract sensor IDs and laser info including name_for_pager
         for laser in laser_data:
             sensor_id = laser.get('serial')
             if sensor_id:
                 berth_sensors.append(sensor_id)
+                sensor_laser_info[sensor_id] = laser
 
         logger.info(f"Found {len(berth_sensors)} sensors for berth {berth_id}: {berth_sensors}")
 
@@ -421,6 +423,11 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
                 # Only include sensors that are in this berth
                 for sensor_id, sensor_data in all_data.get("sensors", {}).items():
                     if sensor_id in berth_sensors:
+                        # Include name_for_pager from laser info if available
+                        laser_info = sensor_laser_info.get(sensor_id, {})
+                        if laser_info.get('name_for_pager'):
+                            sensor_data["name_for_pager"] = laser_info['name_for_pager']
+
                         filtered_data["sensors"][sensor_id] = sensor_data
                         filtered_data["count"] += 1
 

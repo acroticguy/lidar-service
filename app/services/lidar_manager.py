@@ -62,6 +62,7 @@ class LidarManager:
         self.berthing_mode_active: bool = False
         self.berthing_mode_sensors: List[str] = []
         self.berthing_mode_center_stats: Dict[str, Dict] = {}
+        self.berthing_mode_laser_info: Dict[str, Dict] = {}  # Store laser info including name_for_pager
         
         # Berthing measurement systems (ToF-based)
         self.berthing_measurement_systems: Dict[str, BerthingMeasurementSystem] = {}
@@ -2685,12 +2686,14 @@ class LidarManager:
                     "berthing_activated": False
                 }
 
-            # Extract sensor IDs from the laser data
+            # Extract sensor IDs from the laser data and store laser info
             sensor_ids = []
             for laser in laser_data:
                 sensor_id = laser.get('serial')
                 if sensor_id:
                     sensor_ids.append(sensor_id)
+                    # Store laser info including name_for_pager for this sensor
+                    self.berthing_mode_laser_info[sensor_id] = laser
 
             logger.info(f"Found {len(sensor_ids)} sensors for berth {berth_id}: {sensor_ids}")
 
@@ -2811,6 +2814,10 @@ class LidarManager:
                     sensor_ids.append(sensor_id)
 
             logger.info(f"Found {len(sensor_ids)} sensors for berth {berth_id}: {sensor_ids}")
+
+            # Clear laser info for sensors being disabled
+            for sensor_id in sensor_ids:
+                self.berthing_mode_laser_info.pop(sensor_id, None)
 
             if not sensor_ids:
                 logger.warning(f"No valid sensor IDs found in laser data for berth {berth_id}")
