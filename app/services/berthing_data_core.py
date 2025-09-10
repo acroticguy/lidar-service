@@ -47,6 +47,11 @@ async def fetch_berthing_data_for_sensor(sensor_id: str) -> Dict[str, Any]:
     laser_info = lidar_manager.berthing_mode_laser_info.get(sensor_id, {})
     name_for_pager = laser_info.get('name_for_pager')
 
+    # Get berth and berthing info if available
+    berth_info = lidar_manager.berthing_mode_sensor_berth_info.get(sensor_id, {})
+    berth_id = berth_info.get('berth_id')
+    berthing_id = berth_info.get('berthing_id')
+
     result = {
         "sensor_id": sensor_id,
         "timestamp": timestamp,
@@ -72,6 +77,12 @@ async def fetch_berthing_data_for_sensor(sensor_id: str) -> Dict[str, Any]:
     if name_for_pager:
         result["name_for_pager"] = name_for_pager
 
+    # Include berth_id and berthing_id if available
+    if berth_id is not None:
+        result["berth_id"] = berth_id
+    if berthing_id is not None:
+        result["berthing_id"] = berthing_id
+
     return result
     
 async def get_all_berthing_data_core() -> Dict[str, Any]:
@@ -80,7 +91,7 @@ async def get_all_berthing_data_core() -> Dict[str, Any]:
     This function will be used by both the HTTP endpoint and the WebSocket emitter.
     """
     result = {}
-    
+
     for sensor_id in lidar_manager.berthing_mode_sensors:
         if lidar_manager.stream_active.get(sensor_id, False):
             try:
@@ -94,7 +105,7 @@ async def get_all_berthing_data_core() -> Dict[str, Any]:
                     "status": "error",
                     "message": str(e)
                 }
-    
+
     return {
         "sensors": result,
         "count": len(result),

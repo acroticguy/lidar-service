@@ -3,6 +3,12 @@ from typing import Optional, Dict, List, Any
 from enum import Enum
 
 
+class OperationType(str, Enum):
+    BERTH = "berth"
+    DRIFT = "drift"
+    UNMOOR = "unmoor"
+
+
 class LidarStatus(str, Enum):
     DISCONNECTED = "disconnected"
     CONNECTED = "connected"
@@ -87,6 +93,10 @@ class BerthingModeResponse(BaseModel):
     synchronized: bool = False
     last_sync_timestamp: Optional[float] = None
     sync_quality: Optional[str] = None
+
+
+class StartOperationRequest(BaseModel):
+    berthing_id: int = Field(..., description="Berthing operation ID")
 
 
 class ErrorResponse(BaseModel):

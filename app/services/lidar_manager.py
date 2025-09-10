@@ -57,12 +57,16 @@ class LidarManager:
 
         # Fetch local IP once during initialization
         self.local_ip = self._get_local_ip()
+
+        # Track next available fake sensor number
+        self.next_fake_sensor_number = 1
         
         # Berthing mode state
         self.berthing_mode_active: bool = False
         self.berthing_mode_sensors: List[str] = []
         self.berthing_mode_center_stats: Dict[str, Dict] = {}
         self.berthing_mode_laser_info: Dict[str, Dict] = {}  # Store laser info including name_for_pager
+        self.berthing_mode_sensor_berth_info: Dict[str, Dict] = {}  # Store berth_id and berthing_id for each sensor
         
         # Berthing measurement systems (ToF-based)
         self.berthing_measurement_systems: Dict[str, BerthingMeasurementSystem] = {}
@@ -301,17 +305,48 @@ class LidarManager:
 
         except Exception as e:
             logger.error(f"Error connecting to sensor {sensor_id}: {str(e)}")
-    async def connect_fake_lidar(self, sensor_id: str, computer_ip: str, sensor_ip: str,
-                               data_port: int, cmd_port: int, imu_port: Optional[int] = None) -> bool:
-        """Connect to a fake lidar simulator"""
+    async def connect_fake_lidar(self, sensor_id: Optional[str] = None, computer_ip: str = "127.0.0.1",
+                                sensor_ip: str = "127.0.0.1", data_port: Optional[int] = None,
+                                cmd_port: Optional[int] = None, imu_port: Optional[int] = None) -> tuple[bool, str]:
+        """Connect to a fake lidar simulator. If sensor_id is not provided, generates a unique one."""
         try:
             with self.lock:
+                # Generate unique sensor_id if not provided using incremental numbering
+                if not sensor_id:
+                    sensor_id = f"SIM{self.next_fake_sensor_number:04d}"
+                    self.next_fake_sensor_number += 1
+
                 if sensor_id in self.sensors:
                     logger.warning(f"Fake sensor {sensor_id} already connected")
-                    return False
+                    return False, sensor_id
 
-                # Create fake lidar simulator
-                fake_sensor = FakeLidarSimulator(showMessages=True)
+                # Generate unique ports if not provided
+                if data_port is None:
+                    # Find an available port starting from 56001
+                    data_port = 56001
+                    max_attempts = 100  # Prevent infinite loop
+                    attempts = 0
+                    while self._is_port_in_use(data_port) and attempts < max_attempts:
+                        data_port += 10
+                        attempts += 1
+                    if attempts >= max_attempts:
+                        logger.error(f"Could not find available data port after {max_attempts} attempts")
+                        return False, sensor_id
+                    logger.info(f"[DEBUG] Assigned data_port: {data_port} for sensor {sensor_id}")
+
+                if cmd_port is None:
+                    cmd_port = data_port - 1  # cmd_port is usually data_port - 1
+                    # Also check if cmd_port is available
+                    if self._is_port_in_use(cmd_port):
+                        logger.error(f"Command port {cmd_port} is already in use")
+                        return False, sensor_id
+                    logger.info(f"[DEBUG] Assigned cmd_port: {cmd_port} for sensor {sensor_id}")
+
+                # Use sensor_id as the serial number (they should be the same)
+                serial_number = sensor_id
+
+                # Create fake lidar simulator with the sensor_id as serial
+                fake_sensor = FakeLidarSimulator(showMessages=True, serial_number=serial_number)
 
                 # Connect the fake sensor
                 connected = fake_sensor.connect(computer_ip, sensor_ip, data_port, cmd_port, imu_port)
@@ -332,7 +367,8 @@ class LidarManager:
                             "sensor_ip": sensor_ip,
                             "data_port": str(data_port),
                             "cmd_port": str(cmd_port),
-                            "is_simulation": True
+                            "is_simulation": True,
+                            "serial_number": serial_number
                         }
                     )
 
@@ -350,14 +386,33 @@ class LidarManager:
                     await self._update_sensor_info(sensor_id)
 
                     logger.info(f"Successfully connected to fake lidar {sensor_id}")
-                    return True
+                    return True, sensor_id
                 else:
                     logger.error(f"Failed to connect fake lidar {sensor_id}")
-                    return False
+                    return False, sensor_id
 
         except Exception as e:
             logger.error(f"Error connecting fake lidar {sensor_id}: {str(e)}")
-            return False
+            return False, sensor_id
+
+    def _is_port_in_use(self, port: int) -> bool:
+        """Check if a port is already in use by checking connected sensors and system availability"""
+        # First check if already used by connected sensors
+        for sensor_id, info in self.sensor_info.items():
+            if (info.connection_parameters.get("data_port") == str(port) or
+                info.connection_parameters.get("cmd_port") == str(port)):
+                return True
+
+        # Also check if the port is actually available on the system
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(('127.0.0.1', port))
+            return False  # Port is available
+        except OSError:
+            return True  # Port is in use
+        finally:
+            sock.close()  # Ensure socket is always closed
 
     async def auto_connect_all(self, computer_ip: Optional[str] = None) -> int:
         """Auto-connect to all available sensors"""
@@ -562,6 +617,8 @@ class LidarManager:
 
     async def start_data_stream(self, sensor_id: str) -> bool:
         """Start real-time data streaming for a sensor"""
+        logger.info(f"[DEBUG] start_data_stream called for sensor {sensor_id}")
+
         if sensor_id not in self.sensors:
             logger.error(f"Sensor {sensor_id} not found")
             return False
@@ -573,29 +630,35 @@ class LidarManager:
         try:
             # Always use OpenPyLivox for control commands - it handles the handshake
             sensor = self.sensors[sensor_id]
+            is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
 
             # Step 1: Spin up the lidar motor
-            logger.info(f"Step 1: Spinning up lidar for sensor {sensor_id}")
             sensor.lidarSpinUp()
 
             # Step 2: Wait for motor to stabilize
-            logger.info(f"Step 2: Waiting for motor to stabilize...")
             time.sleep(2.0)  # Give more time for spin up
 
             # Step 3: Set coordinate system
-            logger.info(f"Step 3: Setting Cartesian coordinate system")
             sensor.setCartesianCS()
             time.sleep(0.5)  # Small delay after coordinate change
 
             # Step 4: Start data streaming
-            logger.info(f"Step 4: Starting data stream")
             try:
-                # Skip wait for idle to avoid socket buffer errors
-                # Just send the command directly
-                cmd_port = 65000  # Use the standard command port
-                sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (sensor._sensorIP, cmd_port))
-                sensor._isData = True
-                logger.info("Sent data start command successfully")
+                # For fake sensors, we need to use their actual command port, not 65000
+                if is_fake:
+                    cmd_port = sensor._cmdPort
+                    target_ip = sensor._computerIP  # Send to computer IP where socket is bound
+                else:
+                    cmd_port = 65000  # Use the standard command port for real sensors
+                    target_ip = sensor._sensorIP
+
+                try:
+                    sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (target_ip, cmd_port))
+                    sensor._isData = True
+                except Exception as cmd_err:
+                    logger.error(f"Start stream {sensor_id}: Failed to send DATA_START command: {cmd_err}")
+                    return False
+
                 time.sleep(0.5)  # Give time for data to start flowing
             except Exception as e:
                 logger.error(f"Failed to start data stream: {e}")
@@ -665,27 +728,22 @@ class LidarManager:
             sensor = self.sensors[sensor_id]
 
             # Step 1: Stop data streaming first
-            logger.info(f"Step 1: Stopping data stream for sensor {sensor_id}")
             try:
                 # Skip wait for idle to avoid socket buffer errors
                 sensor._cmdSocket.sendto(sensor._CMD_DATA_STOP, (sensor._sensorIP, 65000))
                 sensor._isData = False
-                logger.info("Data stream stopped successfully")
                 time.sleep(0.5)  # Wait for data to stop
             except Exception as e:
                 logger.debug(f"Error stopping data stream: {e}")
 
             # Step 2: Stop the LiDAR motor
-            logger.info(f"Step 2: Spinning down lidar motor for sensor {sensor_id}")
             try:
                 sensor.lidarSpinDown()
-                logger.info("Lidar motor stopped successfully")
                 time.sleep(1.0)  # Wait for motor to stop
             except Exception as e:
                 logger.debug(f"Error spinning down lidar: {e}")
 
             # Step 3: Clear any pending socket data to prevent buffer overflow
-            logger.info(f"Step 3: Clearing socket buffers")
             try:
                 # Clear any pending data from the data socket
                 if hasattr(sensor, '_dataSocket') and sensor._dataSocket:
@@ -706,8 +764,6 @@ class LidarManager:
                         except:
                             break
                     sensor._cmdSocket.setblocking(True)
-
-                logger.info("Socket buffers cleared")
             except Exception as e:
                 logger.debug(f"Error clearing socket buffers: {e}")
 
@@ -1301,7 +1357,7 @@ class LidarManager:
         sensor = self.sensors[sensor_id]
 
         # Check if this is a fake sensor
-        is_fake = hasattr(sensor, '_is_simulation') and sensor._is_simulation
+        is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
         if is_fake:
             logger.info(f"Sensor {sensor_id} is detected as fake lidar")
 
@@ -1470,11 +1526,11 @@ class LidarManager:
                         self.sensor_sync_data[sensor_id]["points"].extend(collected_points)
                         self.sensor_sync_data[sensor_id]["packets_received"] += packets_this_collection
                         self.sensor_sync_data[sensor_id]["last_collection_time"] = current_time
-                        
+
                         # Keep only last 2 seconds of data to prevent memory bloat
                         cutoff_time = current_time - 2.0
                         self.sensor_sync_data[sensor_id]["points"] = [
-                            p for p in self.sensor_sync_data[sensor_id]["points"] 
+                            p for p in self.sensor_sync_data[sensor_id]["points"]
                             if p["collection_time"] >= cutoff_time
                         ]
 
@@ -1543,12 +1599,12 @@ class LidarManager:
                                 # Initialize distance history for sensor if not exists
                                 if sensor_id not in self.sensor_distance_history:
                                     self.sensor_distance_history[sensor_id] = []
-                                
+
                                 # Calculate center stats for this synchronized reading
                                 center_stats = self._calculate_synchronized_center_stats(
                                     sensor_id, recent_points, exact_second, self.sensor_distance_history[sensor_id]
                                 )
-                                
+
                                 synchronized_data[sensor_id] = {
                                     "timestamp": exact_second,
                                     "sensor_id": sensor_id,
@@ -1577,7 +1633,6 @@ class LidarManager:
                     # Also update sensor_sync_data with the full synchronized data including center_stats
                     if sensor_id in self.sensor_sync_data:
                         self.sensor_sync_data[sensor_id].update(data)
-                        logger.info(f"Updated sensor_sync_data for {sensor_id}")
                 
                 # Put synchronized data into queues for each sensor
                 for sensor_id, data in synchronized_data.items():
@@ -2238,14 +2293,26 @@ class LidarManager:
                                 sensor = self.sensors[sensor_id]
                                 if hasattr(sensor, '_cmdSocket') and sensor._cmdSocket:
                                     logger.critical(f"[START] Sending START commands to hardware {sensor_id}")
+
+                                    # Check if this is a fake sensor
+                                    is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
+                                    if is_fake:
+                                        # For fake sensors, send to computer IP with correct port
+                                        target_ip = sensor._computerIP
+                                        cmd_port = sensor._cmdPort
+                                    else:
+                                        # For real sensors, send to sensor IP with standard port
+                                        target_ip = sensor._sensorIP
+                                        cmd_port = 65000
+
                                     # Send start data command directly to ensure hardware is active
-                                    sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (sensor._sensorIP, 65000))
-                                    logger.info(f"[OK] Sent DATA_START to hardware {sensor_id}")
+                                    sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (target_ip, cmd_port))
+                                    logger.info(f"[OK] Sent DATA_START to {sensor_id} at {target_ip}:{cmd_port}")
 
                                     # Wait brief moment and send spin up if needed
                                     await asyncio.sleep(0.5)
-                                    sensor._cmdSocket.sendto(sensor._CMD_LIDAR_SPIN_UP, (sensor._sensorIP, 65000))
-                                    logger.info(f"[OK] Sent SPIN_UP to hardware {sensor_id}")
+                                    sensor._cmdSocket.sendto(sensor._CMD_LIDAR_SPIN_UP, (target_ip, cmd_port))
+                                    logger.info(f"[OK] Sent SPIN_UP to {sensor_id} at {target_ip}:{cmd_port}")
                                 else:
                                     logger.warning(f"[WARN] No command socket for hardware start verification {sensor_id}")
                             except Exception as hw_start_err:
@@ -2453,15 +2520,26 @@ class LidarManager:
                             # Send stop data command
                             if hasattr(sensor, '_cmdSocket') and sensor._cmdSocket:
                                 try:
-                                    sensor._cmdSocket.sendto(sensor._CMD_DATA_STOP, (sensor._sensorIP, 65000))
-                                    logger.info(f"[OK] Sent DATA_STOP to {sensor_id}")
+                                    # Check if this is a fake sensor
+                                    is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
+                                    if is_fake:
+                                        # For fake sensors, send to computer IP with correct port
+                                        target_ip = sensor._computerIP
+                                        cmd_port = sensor._cmdPort
+                                    else:
+                                        # For real sensors, send to sensor IP with standard port
+                                        target_ip = sensor._sensorIP
+                                        cmd_port = 65000
+
+                                    sensor._cmdSocket.sendto(sensor._CMD_DATA_STOP, (target_ip, cmd_port))
+                                    logger.info(f"[OK] Sent DATA_STOP to {sensor_id} at {target_ip}:{cmd_port}")
                                 except Exception as cmd_err:
                                     logger.error(f"[ERROR] Failed to send DATA_STOP to {sensor_id}: {cmd_err}")
                                     network_issues.append(sensor_id)
-                                
+
                                 # Wait a moment
                                 await asyncio.sleep(0.5)
-                                
+
                                 # Send spin down command using high-level API
                                 try:
                                     sensor.lidarSpinDown()
@@ -2640,7 +2718,7 @@ class LidarManager:
                 "sync_quality": "error"
             }
 
-    async def enable_berthing_by_berth(self, berth_id: int, computer_ip: Optional[str] = None, auto_update: bool = False) -> Dict[str, Any]:
+    async def enable_berthing_by_berth(self, berth_id: int, computer_ip: Optional[str] = None, auto_update: bool = False, berthing_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Enable berthing mode for all lasers associated with a specific berth.
 
@@ -2694,6 +2772,11 @@ class LidarManager:
                     sensor_ids.append(sensor_id)
                     # Store laser info including name_for_pager for this sensor
                     self.berthing_mode_laser_info[sensor_id] = laser
+                    # Store berth_id and berthing_id for this sensor
+                    self.berthing_mode_sensor_berth_info[sensor_id] = {
+                        "berth_id": berth_id,
+                        "berthing_id": berthing_id
+                    }
 
             logger.info(f"Found {len(sensor_ids)} sensors for berth {berth_id}: {sensor_ids}")
 
@@ -2815,9 +2898,10 @@ class LidarManager:
 
             logger.info(f"Found {len(sensor_ids)} sensors for berth {berth_id}: {sensor_ids}")
 
-            # Clear laser info for sensors being disabled
+            # Clear laser info and berth info for sensors being disabled
             for sensor_id in sensor_ids:
                 self.berthing_mode_laser_info.pop(sensor_id, None)
+                self.berthing_mode_sensor_berth_info.pop(sensor_id, None)
 
             if not sensor_ids:
                 logger.warning(f"No valid sensor IDs found in laser data for berth {berth_id}")

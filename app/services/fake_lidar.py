@@ -10,7 +10,7 @@ from ..core.logging_config import logger
 class FakeLidarSimulator:
     """Simulates a Livox lidar for testing purposes"""
 
-    def __init__(self, showMessages=False):
+    def __init__(self, showMessages=False, serial_number=None):
         self.is_simulation = True
         self._isConnected = False
         self._isData = False
@@ -19,7 +19,12 @@ class FakeLidarSimulator:
         self._cmdPort = -1
         self._computerIP = ""
         self._deviceType = "Fake-Lidar"
-        self._serial = "SIM0001"
+        # Generate unique serial if not provided
+        if serial_number:
+            self._serial = serial_number
+        else:
+            import uuid
+            self._serial = f"SIM{str(uuid.uuid4())[:8].upper()}"
         self._firmware = "01.00.00"
         self._showMessages = showMessages
         self._dataSocket = None
@@ -40,11 +45,29 @@ class FakeLidarSimulator:
         self._dataSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._cmdSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # Bind sockets
+        # Bind sockets with timeout to prevent hanging
         try:
+            if self._showMessages:
+                logger.info(f"Fake Lidar: Attempting to bind data socket to ({computerIP}, {dataPort})")
+                logger.info(f"Fake Lidar: Attempting to bind cmd socket to ({computerIP}, {cmdPort})")
+
+            # Set a timeout to prevent hanging
+            self._dataSocket.settimeout(5.0)  # 5 second timeout
+            self._cmdSocket.settimeout(5.0)
+
             self._dataSocket.bind((computerIP, dataPort))
-            # For fake lidar, use standard command port 65000 like real sensors
-            self._cmdSocket.bind((computerIP, 65000))
+            if self._showMessages:
+                logger.info(f"Fake Lidar: Successfully bound data socket to ({computerIP}, {dataPort})")
+
+            # Use the provided cmdPort instead of hardcoded 65000
+            self._cmdSocket.bind((computerIP, cmdPort))
+            if self._showMessages:
+                logger.info(f"Fake Lidar: Successfully bound cmd socket to ({computerIP}, {cmdPort})")
+
+            # Set back to blocking mode for normal operation
+            self._dataSocket.setblocking(True)
+            self._cmdSocket.setblocking(True)
+
             self._isConnected = True
 
             # Start command listening thread
@@ -58,6 +81,8 @@ class FakeLidarSimulator:
         except Exception as e:
             if self._showMessages:
                 logger.error(f"Failed to connect Fake Lidar: {e}")
+                import traceback
+                logger.error(f"Fake Lidar connection traceback: {traceback.format_exc()}")
             return 0
 
     def disconnect(self):
@@ -95,8 +120,16 @@ class FakeLidarSimulator:
 
     def dataStart_RT_B(self):
         """Start fake data streaming"""
+        if self._showMessages:
+            logger.info("Fake Lidar: dataStart_RT_B() called")
+
         if not self._isConnected:
+            if self._showMessages:
+                logger.error("Fake Lidar: Cannot start data streaming - not connected")
             return
+
+        if self._showMessages:
+            logger.info("Fake Lidar: Starting data streaming...")
 
         self._isData = True
         self._running = True
@@ -104,11 +137,14 @@ class FakeLidarSimulator:
         self._data_thread.start()
 
         if self._showMessages:
-            logger.info("Fake Lidar: Started data streaming")
+            logger.info("Fake Lidar: Data streaming thread started")
 
-    # Add command constants that openpylivox uses
-    _CMD_DATA_START = b'\xaa\x01\x14\x00\x00\x00\x00\xb5\xed\x01\x01'  # Simplified command
-    _CMD_DATA_STOP = b'\xaa\x01\x14\x00\x00\x00\x00\xb5\xed\x01\x00'   # Simplified command
+    # Add command constants that match OpenPyLivox exactly
+    _CMD_DATA_START = bytes.fromhex('AA011000000000B809000401228D5307')
+    _CMD_DATA_STOP = bytes.fromhex('AA011000000000B809000400B4BD5470')
+    _CMD_LIDAR_SPIN_UP = bytes.fromhex('AA011000000000B809000201E09941F1')
+    _CMD_LIDAR_SPIN_DOWN = bytes.fromhex('AA011000000000B80900020062B94546')
+    _CMD_CARTESIAN_CS = bytes.fromhex('AA011000000000B809000500F58C4F69')
 
     def dataStop(self):
         """Stop fake data streaming"""
@@ -130,13 +166,27 @@ class FakeLidarSimulator:
                 packet = self._create_fake_packet(packet_count)
                 # Send to the computer IP since that's where the socket is bound
                 target_addr = (self._computerIP, self._dataPort)
+
                 self._dataSocket.sendto(packet, target_addr)
                 packet_count += 1
+
                 time.sleep(0.01)  # ~100Hz
 
+            except ConnectionResetError as e:
+                # Handle connection reset gracefully
+                if self._running:
+                    logger.debug(f"Fake Lidar {self._serial}: Connection reset while sending data, continuing...")
+                continue
+            except OSError as e:
+                # Handle other socket errors
+                if self._running:
+                    logger.debug(f"Fake Lidar {self._serial}: Socket error while sending data: {e}, continuing...")
+                continue
             except Exception as e:
-                if self._showMessages:
-                    logger.info(f"Fake Lidar: Error sending data: {e}")
+                if self._running:  # Only log if not shutting down
+                    logger.error(f"Fake Lidar {self._serial}: Error sending data: {e}")
+                    import traceback
+                    logger.error(f"Fake Lidar {self._serial}: {traceback.format_exc()}")
                 break
 
     def _create_fake_packet(self, packet_count: int) -> bytes:
@@ -202,24 +252,47 @@ class FakeLidarSimulator:
                 self._cmdSocket.settimeout(0.1)
                 data, addr = self._cmdSocket.recvfrom(1024)
 
-                # Check if this is a data start command
-                if len(data) >= 11 and data[:11] == self._CMD_DATA_START[:11]:
-                    if self._showMessages:
-                        logger.info("Fake Lidar: Received data start command")
+                # Check if this is a data start command (use full command length)
+                if len(data) >= len(self._CMD_DATA_START) and data == self._CMD_DATA_START:
+                    logger.info(f"Fake Lidar {self._serial}: Received data start command - starting data streaming")
                     self.dataStart_RT_B()
 
-                # Check if this is a data stop command
-                elif len(data) >= 11 and data[:11] == self._CMD_DATA_STOP[:11]:
-                    if self._showMessages:
-                        logger.info("Fake Lidar: Received data stop command")
+                # Check if this is a data stop command (use full command length)
+                elif len(data) >= len(self._CMD_DATA_STOP) and data == self._CMD_DATA_STOP:
+                    logger.info(f"Fake Lidar {self._serial}: Received data stop command - stopping data streaming")
                     self.dataStop()
+
+                # Check if this is a spin up command (use full command length)
+                elif len(data) >= len(self._CMD_LIDAR_SPIN_UP) and data == self._CMD_LIDAR_SPIN_UP:
+                    logger.debug(f"Fake Lidar {self._serial}: Received spin up command")
+                    self.lidarSpinUp()
+
+                # Check if this is a spin down command (use full command length)
+                elif len(data) >= len(self._CMD_LIDAR_SPIN_DOWN) and data == self._CMD_LIDAR_SPIN_DOWN:
+                    logger.debug(f"Fake Lidar {self._serial}: Received spin down command")
+                    self.lidarSpinDown()
+
+                else:
+                    logger.debug(f"Fake Lidar {self._serial}: Unknown command received: {data.hex() if len(data) <= 20 else data[:20].hex() + '...'}")
 
             except socket.timeout:
                 continue
+            except ConnectionResetError as e:
+                # This can happen on Windows when the remote host closes the connection
+                # For UDP, this shouldn't normally happen, but let's handle it gracefully
+                if self._command_running:
+                    logger.debug(f"Fake Lidar {self._serial}: Connection reset (normal for UDP), continuing...")
+                continue
+            except OSError as e:
+                # Handle other socket errors
+                if self._command_running:
+                    logger.debug(f"Fake Lidar {self._serial}: Socket error: {e}, continuing...")
+                continue
             except Exception as e:
                 if self._command_running:  # Only log if not shutting down
-                    if self._showMessages:
-                        logger.error(f"Fake Lidar: Command listener error: {e}")
+                    logger.error(f"Fake Lidar {self._serial}: Command listener error: {e}")
+                    import traceback
+                    logger.error(f"Fake Lidar {self._serial}: {traceback.format_exc()}")
                 break
 
     def serialNumber(self) -> str:
@@ -232,7 +305,7 @@ class FakeLidarSimulator:
 
     def connectionParameters(self):
         """Return connection parameters"""
-        return [self._computerIP, self._sensorIP, self._dataPort, 65000]  # Use standard cmd port
+        return [self._computerIP, self._sensorIP, self._dataPort, self._cmdPort]
 
     def setCartesianCS(self):
         """Set coordinate system (no-op for fake)"""

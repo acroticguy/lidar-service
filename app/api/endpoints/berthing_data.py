@@ -10,7 +10,7 @@ from ...services.berthing_data_core import fetch_berthing_data_for_sensor
 from ...services.lidar_manager import lidar_manager
 from ...core.logging_config import logger
 from ...services.db_streamer_service import db_streamer_service
-from ...models.lidar import OperationResponse
+from ...models.lidar import OperationResponse, StartOperationRequest, OperationType
 
 router = APIRouter()
 
@@ -243,52 +243,60 @@ async def stop_db_streaming_endpoint():
         raise HTTPException(status_code=500, detail=f"Failed to stop DB streaming: {e}")
 
 
-@router.post("/berth/{berth_id}/activate", response_model=Dict[str, Any])
-async def activate_berthing_by_berth(berth_id: int, computer_ip: Optional[str] = None, auto_update: bool = False):
+@router.post("/berth/{berth_id}/start_operation/{operation_type}", response_model=Dict[str, Any])
+async def start_operation_by_berth(berth_id: int, operation_type: OperationType, request: StartOperationRequest):
     """
-    Activate berthing mode for all lasers associated with a specific berth.
+    Start berthing operation for all lasers associated with a specific berth.
 
     This endpoint:
     1. Queries the database to find all lasers for the berth
     2. Enables berthing mode for those lasers
-    3. Starts database consumer if auto_update is True
+    3. Starts database consumer if operation_type is BERTH or UNMOOR
 
     Args:
-        berth_id: The berth ID to activate berthing for
-        computer_ip: Optional computer IP for sensor discovery
-        auto_update: Whether to start the database consumer for automatic data streaming
+        berth_id: The berth ID to start operation for
+        operation_type: The type of operation (BERTH, DRIFT, or UNMOOR)
+        request: Request body with berthing_id
 
     Returns:
-        Dictionary with activation results including:
-        - success: Whether activation was successful
+        Dictionary with operation results including:
+        - success: Whether operation was successful
         - berth_id: The berth ID that was processed
+        - berthing_id: The berthing operation ID
+        - operation_type: The operation type
         - lasers_found: List of lasers associated with the berth
         - sensor_ids: List of sensor IDs that were activated
         - berthing_result: Detailed berthing mode activation results
         - db_consumer_started: Whether database consumer was started
     """
     try:
-        logger.info(f"Activating berthing mode for berth {berth_id}")
+        logger.info(f"Starting berthing operation {operation_type.value} for berth {berth_id}, berthing_id {request.berthing_id}")
 
-        result = await lidar_manager.enable_berthing_by_berth(berth_id, computer_ip, auto_update)
+        # Determine auto_update based on operation_type
+        auto_update = operation_type in [OperationType.BERTH, OperationType.UNMOOR]
+
+        result = await lidar_manager.enable_berthing_by_berth(berth_id, None, auto_update, request.berthing_id)
 
         if result.get("success"):
-            logger.info(f"Successfully activated berthing mode for berth {berth_id}")
+            logger.info(f"Successfully started berthing operation {operation_type.value} for berth {berth_id}")
+            # Add berthing_id and operation_type to result
+            result["berthing_id"] = request.berthing_id
+            result["operation_type"] = operation_type.value
             return result
         else:
-            logger.warning(f"Failed to activate berthing mode for berth {berth_id}: {result.get('message')}")
+            logger.warning(f"Failed to start berthing operation {operation_type.value} for berth {berth_id}: {result.get('message')}")
             raise HTTPException(
                 status_code=400,
-                detail=result.get("message", f"Failed to activate berthing for berth {berth_id}")
+                detail=result.get("message", f"Failed to start operation for berth {berth_id}")
             )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error activating berthing for berth {berth_id}: {str(e)}")
+        logger.error(f"Error starting berthing operation {operation_type.value} for berth {berth_id}: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Internal error activating berthing for berth {berth_id}: {str(e)}"
+            detail=f"Internal error starting operation {operation_type.value} for berth {berth_id}: {str(e)}"
         )
 
 
@@ -443,10 +451,10 @@ async def get_berth_sensors_status(berth_id: int):
         )
 
 
-@router.post("/berth/{berth_id}/deactivate", response_model=Dict[str, Any])
-async def deactivate_berthing_by_berth(berth_id: int):
+@router.post("/berth/{berth_id}/stop_operation", response_model=Dict[str, Any])
+async def stop_operation_by_berth(berth_id: int):
     """
-    Deactivate berthing mode for all lasers associated with a specific berth.
+    Stop berthing operation for all lasers associated with a specific berth.
 
     This endpoint:
     1. Queries the database to find all lasers for the berth
@@ -454,11 +462,11 @@ async def deactivate_berthing_by_berth(berth_id: int):
     3. Stops database streaming if it was started for this berth
 
     Args:
-        berth_id: The berth ID to deactivate berthing for
+        berth_id: The berth ID to stop operation for
 
     Returns:
-        Dictionary with deactivation results including:
-        - success: Whether deactivation was successful
+        Dictionary with stop results including:
+        - success: Whether stop was successful
         - berth_id: The berth ID that was processed
         - lasers_found: List of lasers associated with the berth
         - sensor_ids: List of sensor IDs that were deactivated
@@ -466,25 +474,25 @@ async def deactivate_berthing_by_berth(berth_id: int):
         - db_streaming_stopped: Whether database streaming was stopped
     """
     try:
-        logger.info(f"Deactivating berthing mode for berth {berth_id}")
+        logger.info(f"Stopping berthing operation for berth {berth_id}")
 
         result = await lidar_manager.disable_berthing_by_berth(berth_id)
 
         if result.get("success"):
-            logger.info(f"Successfully deactivated berthing mode for berth {berth_id}")
+            logger.info(f"Successfully stopped berthing operation for berth {berth_id}")
             return result
         else:
-            logger.warning(f"Failed to deactivate berthing mode for berth {berth_id}: {result.get('message')}")
+            logger.warning(f"Failed to stop berthing operation for berth {berth_id}: {result.get('message')}")
             raise HTTPException(
                 status_code=400,
-                detail=result.get("message", f"Failed to deactivate berthing for berth {berth_id}")
+                detail=result.get("message", f"Failed to stop operation for berth {berth_id}")
             )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deactivating berthing for berth {berth_id}: {str(e)}")
+        logger.error(f"Error stopping berthing operation for berth {berth_id}: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Internal error deactivating berthing for berth {berth_id}: {str(e)}"
+            detail=f"Internal error stopping operation for berth {berth_id}: {str(e)}"
         )

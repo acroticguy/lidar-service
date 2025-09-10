@@ -123,7 +123,7 @@ class DatabaseConsumer:
                 berthing_id = data.get('berthing_id')  # Allows None if not present
 
                 logger.debug(f"Preparing to send data for sensor {sensor_id} at {dt_iso_format} to PostgREST.")
-                
+
                 payload = {
                     "p_serial": sensor_id,
                     "p_dt": dt_iso_format,
@@ -131,7 +131,7 @@ class DatabaseConsumer:
                     "p_speed": speed,
                     "p_temperature": temperature,
                     "p_strength": strength,
-                    "p_berthing_id": berthing_id
+                    "p_berthing_id": berthing_id,
                 }
 
                 # Make POST request to PostgREST RPC endpoint (single data point)

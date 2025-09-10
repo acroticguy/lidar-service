@@ -190,31 +190,32 @@ async def berthing_mode_status():
         
     except Exception as e:
         logger.error(f"Error getting berthing mode status: {str(e)}")
+
+
 @router.post("/connect-fake-lidar", response_model=OperationResponse)
 async def connect_fake_lidar():
-    """Connect to a fake lidar simulator for testing"""
+    """Connect to a fake lidar simulator for testing. Each call creates a different fake lidar."""
     try:
-        success = await lidar_manager.connect_fake_lidar(
-            sensor_id="SIM0001",  # Fixed ID for fake lidar
+        success, sensor_id = await lidar_manager.connect_fake_lidar(
+            sensor_id=None,  # Let the manager generate a unique ID
             computer_ip="127.0.0.1",
             sensor_ip="127.0.0.1",
-            data_port=56001,
-            cmd_port=56000,
+            data_port=None,  # Let the manager find available ports
+            cmd_port=None,
             imu_port=None
         )
 
         if success:
             return OperationResponse(
                 success=True,
-                message="Successfully connected to fake lidar simulator",
-                data={"sensor_id": "SIM0001", "is_simulation": True}
+                message=f"Successfully connected to fake lidar simulator {sensor_id}",
+                data={"sensor_id": sensor_id, "is_simulation": True}
             )
         else:
-            raise HTTPException(status_code=400, detail="Failed to connect to fake lidar")
+            raise HTTPException(status_code=400, detail=f"Failed to connect to fake lidar {sensor_id}")
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error connecting to fake lidar: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))

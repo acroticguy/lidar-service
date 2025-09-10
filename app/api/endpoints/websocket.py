@@ -5,6 +5,7 @@ import json
 import time
 import base64
 import queue
+import math
 from ...services.lidar_manager import lidar_manager
 from ...core.logging_config import logger
 from ...services.berthing_data_core import get_all_berthing_data_core # Import the core data function
@@ -420,6 +421,9 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
                     "berth_sensors": berth_sensors
                 }
 
+                # Collect distances for deg calculation
+                distances = []
+
                 # Only include sensors that are in this berth
                 for sensor_id, sensor_data in all_data.get("sensors", {}).items():
                     if sensor_id in berth_sensors:
@@ -430,6 +434,26 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
 
                         filtered_data["sensors"][sensor_id] = sensor_data
                         filtered_data["count"] += 1
+
+                        # Collect distance for deg calculation
+                        if sensor_data.get("status") == "active" and "distance" in sensor_data:
+                            distances.append(sensor_data["distance"])
+
+                # Calculate deg based on two distance measurements for this berth
+                deg = 0.0
+                baseline = 75.0  # Distance between the two sensors in meters
+                if len(distances) == 2:
+                    dist1, dist2 = distances
+                    if dist1 > 0 and dist2 > 0:  # Ensure valid distances
+                        diff = abs(dist1 - dist2)
+                        if diff == 0:
+                            deg = 0.0
+                        else:
+                            # Calculate angle using arcsin of (difference / baseline)
+                            # This gives 0-90 degrees based on the geometric relationship
+                            deg = math.degrees(math.asin(min(diff / baseline, 1.0)))
+
+                filtered_data["deg"] = deg
 
                 # Send filtered data
                 await websocket.send_text(json.dumps(filtered_data))
