@@ -81,8 +81,8 @@ async def auto_connect_all(request: LidarAutoConnectRequest = LidarAutoConnectRe
 async def disconnect_sensor(sensor_id: str):
     """Disconnect a specific sensor"""
     try:
-        success = await lidar_manager.disconnect_sensor(sensor_id)
-        
+        success = await lidar_manager.disconnect_sensor(sensor_id, force=True)
+
         if success:
             return OperationResponse(
                 success=True,
@@ -90,7 +90,7 @@ async def disconnect_sensor(sensor_id: str):
             )
         else:
             raise HTTPException(status_code=404, detail="Sensor not found")
-            
+
     except HTTPException:
         raise
     except Exception as e:
@@ -104,17 +104,17 @@ async def disconnect_all_sensors():
     try:
         sensors = list(lidar_manager.sensors.keys())
         disconnected = 0
-        
+
         for sensor_id in sensors:
-            if await lidar_manager.disconnect_sensor(sensor_id):
+            if await lidar_manager.disconnect_sensor(sensor_id, force=True):
                 disconnected += 1
-        
+
         return OperationResponse(
             success=True,
             message=f"Disconnected {disconnected} sensors",
             data={"disconnected_count": disconnected}
         )
-        
+
     except Exception as e:
         logger.error(f"Error disconnecting all sensors: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
