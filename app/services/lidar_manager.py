@@ -2093,9 +2093,24 @@ class LidarManager:
         try:
             # Step 1: FORCE berthing mode state activation FIRST
             logger.critical("[START] FORCE setting berthing mode state")
-            self.berthing_mode_active = True
-            self.berthing_mode_sensors = sensor_ids.copy()
-            self.berthing_mode_center_stats = {}
+
+            # Add new sensors to the existing berthing mode sensors list (don't replace)
+            # This allows multiple berths to be active concurrently
+            with self.lock:
+                for sensor_id in sensor_ids:
+                    if sensor_id not in self.berthing_mode_sensors:
+                        self.berthing_mode_sensors.append(sensor_id)
+                        logger.info(f"Added sensor {sensor_id} to berthing mode")
+
+                # Activate berthing mode if not already active
+                if not self.berthing_mode_active:
+                    self.berthing_mode_active = True
+                    logger.info("Berthing mode activated")
+
+                # Initialize center stats for new sensors only
+                for sensor_id in sensor_ids:
+                    if sensor_id not in self.berthing_mode_center_stats:
+                        self.berthing_mode_center_stats[sensor_id] = {}
 
             # Step 2: Discover sensors with retry mechanism
             logger.critical("[START] Discovering sensors with network reliability checks")
@@ -2331,22 +2346,25 @@ class LidarManager:
             
             # Step 3: FORCE berthing mode state reset regardless of network issues
             logger.critical("[STOP] FORCE resetting berthing mode state")
-            
-            # Remove ALL specified sensors from berthing mode
-            original_berthing_sensors = self.berthing_mode_sensors.copy()
-            self.berthing_mode_sensors = [s for s in self.berthing_mode_sensors if s not in sensor_ids]
-            
-            # Clear center stats for ALL specified sensors
-            for sensor_id in sensor_ids:
-                self.berthing_mode_center_stats.pop(sensor_id, None)
-                self.vessel_speed_calculators.pop(sensor_id, None)
-            
-            # If no sensors left, disable berthing mode completely
-            if not self.berthing_mode_sensors:
-                logger.critical("[STOP] NO SENSORS LEFT - DISABLING BERTHING MODE COMPLETELY")
-                self.berthing_mode_active = False
-                self.berthing_mode_center_stats = {}
-                self.sync_coordinator_active = False
+
+            # Remove specified sensors from berthing mode (thread-safe)
+            with self.lock:
+                original_berthing_sensors = self.berthing_mode_sensors.copy()
+                self.berthing_mode_sensors = [s for s in self.berthing_mode_sensors if s not in sensor_ids]
+
+                # Clear center stats for specified sensors only
+                for sensor_id in sensor_ids:
+                    self.berthing_mode_center_stats.pop(sensor_id, None)
+                    self.vessel_speed_calculators.pop(sensor_id, None)
+
+                # If no sensors left, disable berthing mode completely
+                if not self.berthing_mode_sensors:
+                    logger.critical("[STOP] NO SENSORS LEFT - DISABLING BERTHING MODE COMPLETELY")
+                    self.berthing_mode_active = False
+                    self.berthing_mode_center_stats = {}
+                    self.sync_coordinator_active = False
+                else:
+                    logger.info(f"Berthing mode still active with {len(self.berthing_mode_sensors)} sensors remaining")
             
             # Calculate final state
             remaining_connected = [s for s in self.berthing_mode_sensors if s in self.sensors]
@@ -2532,7 +2550,17 @@ class LidarManager:
 
             # Step 2: Enable berthing mode for the discovered sensors
             logger.info(f"Enabling berthing mode for sensors: {sensor_ids}")
+
+            # Check if berthing mode is already active with other sensors
+            already_active = self.berthing_mode_active and len(self.berthing_mode_sensors) > 0
+            if already_active:
+                logger.info(f"Berthing mode already active with {len(self.berthing_mode_sensors)} sensors, adding berth {berth_id} sensors")
+
             berthing_result = await self.enable_berthing_mode(sensor_ids, computer_ip)
+
+            # Update the result to reflect that this berth was added to existing berthing mode
+            if already_active and berthing_result.get("active"):
+                berthing_result["message"] = f"Berth {berth_id} sensors added to existing berthing mode"
 
             # Step 3: Start database streamer if auto_update is enabled
             db_streamer_started = False
