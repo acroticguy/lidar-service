@@ -89,11 +89,20 @@ async def get_all_berthing_data_core() -> Dict[str, Any]:
     """
     Get berthing data for all active sensors from the core logic.
     This function will be used by both the HTTP endpoint and the WebSocket emitter.
+    Thread-safe implementation to handle concurrent sensor list changes.
     """
     result = {}
 
-    for sensor_id in lidar_manager.berthing_mode_sensors:
-        if lidar_manager.stream_active.get(sensor_id, False):
+    # Create a snapshot of the sensor list to avoid concurrent modification issues
+    with lidar_manager.lock:
+        active_sensors = list(lidar_manager.berthing_mode_sensors)
+        berthing_mode_active = lidar_manager.berthing_mode_active
+        sync_coordinator_active = lidar_manager.sync_coordinator_active
+
+    # Fetch data for each sensor outside the lock to avoid blocking
+    for sensor_id in active_sensors:
+        # Double-check sensor is still active (it might have been removed)
+        if sensor_id in lidar_manager.berthing_mode_sensors and lidar_manager.stream_active.get(sensor_id, False):
             try:
                 # Reuse the individual sensor data fetching logic
                 sensor_data = await fetch_berthing_data_for_sensor(sensor_id)
@@ -109,7 +118,7 @@ async def get_all_berthing_data_core() -> Dict[str, Any]:
     return {
         "sensors": result,
         "count": len(result),
-        "berthing_mode_active": lidar_manager.berthing_mode_active,
-        "synchronized": lidar_manager.sync_coordinator_active,
+        "berthing_mode_active": berthing_mode_active,
+        "synchronized": sync_coordinator_active,
         "_server_timestamp_utc": time.time() # Add server timestamp here for consistency
     }

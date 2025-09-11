@@ -100,16 +100,49 @@ class ConnectionManager:
     async def _all_berthing_data_emitter_task(self):
         """
         Background task to periodically fetch and broadcast aggregated berthing data.
+        Handles dynamic sensor changes gracefully.
         """
         logger.info("Starting global berthing data emitter task...")
+        last_sensor_count = 0
+        last_sync_timestamp = 0
+
         while True:
             try:
                 start_time = asyncio.get_event_loop().time() # Use monotonic time for accurate intervals
-                
+
                 # Only fetch if there are active global connections
                 if self.global_berthing_connections:
-                    all_data = await get_all_berthing_data_core()
-                    await self.broadcast_all_berthing_data(all_data)
+                    try:
+                        all_data = await get_all_berthing_data_core()
+
+                        # Check if sensor configuration has changed
+                        current_sensor_count = len(all_data.get("sensors", {}))
+                        current_sync_timestamp = all_data.get("_server_timestamp_utc", 0)
+
+                        # Log changes in sensor configuration
+                        if current_sensor_count != last_sensor_count:
+                            logger.info(f"Sensor configuration changed: {last_sensor_count} -> {current_sensor_count} sensors")
+                            last_sensor_count = current_sensor_count
+
+                        # Only broadcast if we have new data or sensor changes
+                        if current_sync_timestamp > last_sync_timestamp or current_sensor_count != last_sensor_count:
+                            await self.broadcast_all_berthing_data(all_data)
+                            last_sync_timestamp = current_sync_timestamp
+                        else:
+                            logger.debug("No new berthing data to broadcast")
+
+                    except Exception as data_error:
+                        logger.error(f"Error fetching berthing data: {data_error}")
+                        # Send error message to clients
+                        error_data = {
+                            "sensors": {},
+                            "count": 0,
+                            "berthing_mode_active": False,
+                            "synchronized": False,
+                            "_server_timestamp_utc": time.time(),
+                            "error": f"Data fetch error: {str(data_error)}"
+                        }
+                        await self.broadcast_all_berthing_data(error_data)
                 else:
                     logger.debug("No global berthing clients, skipping data fetch and broadcast.")
 
@@ -331,6 +364,7 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
     """
     WebSocket endpoint for streaming berthing data for sensors associated with a specific berth.
     Clients subscribe here to receive filtered data for only the sensors in their berth.
+    This endpoint subscribes to the global berthing data stream and filters it.
     """
     import httpx
     from ...core.config import settings
@@ -404,72 +438,104 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
             "message": f"Berth-specific berthing data stream started for berth {berth_id}"
         }))
 
-        # Stream filtered berthing data
+        # Subscribe to global berthing data stream instead of creating our own loop
+        # This prevents conflicts with the global stream
+        last_data_timestamp = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+
         while True:
             try:
-                # Get all berthing data
-                all_data = await get_all_berthing_data_core()
+                # Check if there's new data available by monitoring the global data
+                current_data = await get_all_berthing_data_core()
+                current_timestamp = current_data.get("_server_timestamp_utc", 0)
 
-                # Filter to only include sensors for this berth
-                filtered_data = {
-                    "sensors": {},
-                    "count": 0,
-                    "berthing_mode_active": all_data.get("berthing_mode_active", False),
-                    "synchronized": all_data.get("synchronized", False),
-                    "_server_timestamp_utc": all_data.get("_server_timestamp_utc", time.time()),
-                    "berth_id": berth_id,
-                    "berth_sensors": berth_sensors
-                }
+                # Only process if we have new data
+                if current_timestamp > last_data_timestamp:
+                    last_data_timestamp = current_timestamp
+                    consecutive_errors = 0  # Reset error counter on successful data fetch
 
-                # Collect distances for deg calculation
-                distances = []
+                    # Filter to only include sensors for this berth
+                    filtered_data = {
+                        "sensors": {},
+                        "count": 0,
+                        "berthing_mode_active": current_data.get("berthing_mode_active", False),
+                        "synchronized": current_data.get("synchronized", False),
+                        "_server_timestamp_utc": current_timestamp,
+                        "berth_id": berth_id,
+                        "berth_sensors": berth_sensors
+                    }
 
-                # Only include sensors that are in this berth
-                for sensor_id, sensor_data in all_data.get("sensors", {}).items():
-                    if sensor_id in berth_sensors:
-                        # Include name_for_pager from laser info if available
-                        laser_info = sensor_laser_info.get(sensor_id, {})
-                        if laser_info.get('name_for_pager'):
-                            sensor_data["name_for_pager"] = laser_info['name_for_pager']
+                    # Collect distances for deg calculation
+                    distances = []
 
-                        filtered_data["sensors"][sensor_id] = sensor_data
-                        filtered_data["count"] += 1
+                    # Only include sensors that are in this berth and still active
+                    active_berth_sensors = 0
+                    for sensor_id, sensor_data in current_data.get("sensors", {}).items():
+                        if sensor_id in berth_sensors:
+                            # Double-check sensor is still in berthing mode
+                            if sensor_id in lidar_manager.berthing_mode_sensors:
+                                # Include name_for_pager from laser info if available
+                                laser_info = sensor_laser_info.get(sensor_id, {})
+                                if laser_info.get('name_for_pager'):
+                                    sensor_data["name_for_pager"] = laser_info['name_for_pager']
 
-                        # Collect distance for deg calculation
-                        if sensor_data.get("status") == "active" and "distance" in sensor_data:
-                            distances.append(sensor_data["distance"])
+                                filtered_data["sensors"][sensor_id] = sensor_data
+                                filtered_data["count"] += 1
+                                active_berth_sensors += 1
 
-                # Calculate deg based on two distance measurements for this berth
-                deg = 0.0
-                baseline = 75.0  # Distance between the two sensors in meters
-                if len(distances) == 2:
-                    dist1, dist2 = distances
-                    if dist1 > 0 and dist2 > 0:  # Ensure valid distances
-                        diff = abs(dist1 - dist2)
-                        if diff == 0:
-                            deg = 0.0
-                        else:
-                            # Calculate angle using arcsin of (difference / baseline)
-                            # This gives 0-90 degrees based on the geometric relationship
-                            deg = math.degrees(math.asin(min(diff / baseline, 1.0)))
+                                # Collect distance for deg calculation
+                                if sensor_data.get("status") == "active" and "distance" in sensor_data:
+                                    distances.append(sensor_data["distance"])
+                            else:
+                                logger.debug(f"Sensor {sensor_id} no longer in berthing mode, excluding from berth {berth_id}")
 
-                filtered_data["deg"] = deg
+                    # Log if berth sensors have changed
+                    if active_berth_sensors != len(berth_sensors):
+                        logger.info(f"Berth {berth_id}: {active_berth_sensors}/{len(berth_sensors)} sensors active")
 
-                # Send filtered data
-                await websocket.send_text(json.dumps(filtered_data))
+                    # Calculate deg based on two distance measurements for this berth
+                    deg = 0.0
+                    baseline = 75.0  # Distance between the two sensors in meters
+                    if len(distances) == 2:
+                        dist1, dist2 = distances
+                        if dist1 > 0 and dist2 > 0:  # Ensure valid distances
+                            diff = abs(dist1 - dist2)
+                            if diff == 0:
+                                deg = 0.0
+                            else:
+                                # Calculate angle using arcsin of (difference / baseline)
+                                # This gives 0-90 degrees based on the geometric relationship
+                                deg = math.degrees(math.asin(min(diff / baseline, 1.0)))
 
-                # Wait before next update (same interval as global stream)
+                    filtered_data["deg"] = deg
+
+                    # Send filtered data
+                    await websocket.send_text(json.dumps(filtered_data))
+
+                # Wait before checking for new data (same interval as global stream)
                 await asyncio.sleep(1.0)
 
             except WebSocketDisconnect:
                 break
             except Exception as e:
-                logger.error(f"Error in berth-specific stream for berth {berth_id}: {e}")
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": f"Stream error: {str(e)}"
-                }))
-                break
+                consecutive_errors += 1
+                logger.error(f"Error in berth-specific stream for berth {berth_id} (attempt {consecutive_errors}): {e}")
+
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"Too many consecutive errors for berth {berth_id}, closing connection")
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"Stream failed after {max_consecutive_errors} consecutive errors"
+                    }))
+                    break
+                else:
+                    # Send error but continue
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"Stream error: {str(e)}"
+                    }))
+                    await asyncio.sleep(1.0)  # Wait before retrying
 
     except WebSocketDisconnect:
         logger.info(f"Client disconnected from berth-specific stream for berth {berth_id}")
