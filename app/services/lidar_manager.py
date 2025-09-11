@@ -2242,36 +2242,67 @@ class LidarManager:
     async def disable_berthing_mode(self, sensor_ids: List[str]) -> Dict[str, Any]:
         """CRITICAL: Disable berthing mode - ENSURES hardware actually stops even with network issues"""
         logger.critical(f"[STOP] CRITICAL: Disabling berthing mode for sensors: {sensor_ids}")
-        
+
         disconnected_sensors = []
         failed_sensors = []
         network_issues = []
-        
+        skipped_sensors = []
+
         try:
+            # Step 0: Check which sensors are actually in berthing mode
+            sensors_in_berthing = [s for s in sensor_ids if s in self.berthing_mode_sensors]
+            sensors_not_in_berthing = [s for s in sensor_ids if s not in self.berthing_mode_sensors]
+
+            # Log and skip sensors not in berthing mode
+            if sensors_not_in_berthing:
+                logger.info(f"[SKIP] Skipping sensors not in berthing mode: {sensors_not_in_berthing}")
+                skipped_sensors.extend(sensors_not_in_berthing)
+
+            # If no sensors are actually in berthing mode, return early
+            if not sensors_in_berthing:
+                logger.warning(f"[SKIP] No sensors from the requested list are currently in berthing mode")
+                return {
+                    "active": self.berthing_mode_active,
+                    "connected_sensors": [s for s in self.berthing_mode_sensors if s in self.sensors],
+                    "streaming_sensors": [s for s in self.berthing_mode_sensors if self.stream_active.get(s, False)],
+                    "message": f"No sensors to disable - none of the requested sensors are in berthing mode",
+                    "synchronized": self.sync_coordinator_active,
+                    "last_sync_timestamp": self.last_sync_timestamp,
+                    "sync_quality": "none" if not self.sync_coordinator_active else "high",
+                    "disconnected_sensors": [],
+                    "failed_sensors": [],
+                    "skipped_sensors": skipped_sensors,
+                    "network_issues": []
+                }
+
+            # Use only sensors that are actually in berthing mode
+            actual_sensor_ids = sensors_in_berthing
+            logger.critical(f"[STOP] Proceeding with disabling berthing mode for sensors actually in berthing mode: {actual_sensor_ids}")
+
             # Step 1: Stop synchronization coordinator IMMEDIATELY
-            remaining_after_removal = [s for s in self.berthing_mode_sensors if s not in sensor_ids]
+            remaining_after_removal = [s for s in self.berthing_mode_sensors if s not in actual_sensor_ids]
             if not remaining_after_removal:
                 logger.critical("[STOP] Stopping sync coordinator")
                 self._stop_sync_coordinator()
                 
             # Step 2: AGGRESSIVELY stop streaming and hardware for each sensor
-            for sensor_id in sensor_ids:
+            for sensor_id in actual_sensor_ids:
                 logger.critical(f"[STOP] Processing disable for sensor {sensor_id}")
-                
+
                 try:
                     # Check if sensor exists and is streaming
                     sensor_active = sensor_id in self.sensors
                     is_streaming = self.stream_active.get(sensor_id, False)
-                    
+
                     logger.info(f"Sensor {sensor_id}: active={sensor_active}, streaming={is_streaming}")
-                    
+
                     if sensor_active:
                         sensor = self.sensors[sensor_id]
-                        
+
                         # CRITICAL: Send hardware stop commands directly
                         try:
                             logger.critical(f"[STOP] Sending STOP commands to hardware {sensor_id}")
-                            
+
                             # Send stop data command
                             if hasattr(sensor, '_cmdSocket') and sensor._cmdSocket:
                                 try:
@@ -2305,11 +2336,11 @@ class LidarManager:
                             else:
                                 logger.warning(f"[WARN] No command socket for {sensor_id}")
                                 network_issues.append(sensor_id)
-                                
+
                         except Exception as hw_error:
                             logger.error(f"[ERROR] Hardware stop failed for {sensor_id}: {hw_error}")
                             network_issues.append(sensor_id)
-                        
+
                         # Also use high-level stop methods
                         if is_streaming:
                             try:
@@ -2321,7 +2352,7 @@ class LidarManager:
                                     logger.warning(f"[WARN] High-level stop failed for {sensor_id}")
                             except Exception as stop_error:
                                 logger.error(f"[ERROR] High-level stop error for {sensor_id}: {stop_error}")
-                        
+
                         # Force disconnect
                         try:
                             logger.info(f"[STOP] Force disconnecting {sensor_id}")
@@ -2335,11 +2366,11 @@ class LidarManager:
                         except Exception as disc_error:
                             logger.error(f"[ERROR] Disconnect error for {sensor_id}: {disc_error}")
                             failed_sensors.append(sensor_id)
-                            
+
                     else:
                         logger.warning(f"[WARN] Sensor {sensor_id} not found in active sensors - assuming already disconnected")
                         disconnected_sensors.append(sensor_id)
-                        
+
                 except Exception as sensor_error:
                     logger.error(f"[ERROR] Critical error processing sensor {sensor_id}: {sensor_error}")
                     failed_sensors.append(sensor_id)
@@ -2350,10 +2381,10 @@ class LidarManager:
             # Remove specified sensors from berthing mode (thread-safe)
             with self.lock:
                 original_berthing_sensors = self.berthing_mode_sensors.copy()
-                self.berthing_mode_sensors = [s for s in self.berthing_mode_sensors if s not in sensor_ids]
+                self.berthing_mode_sensors = [s for s in self.berthing_mode_sensors if s not in actual_sensor_ids]
 
                 # Clear center stats for specified sensors only
-                for sensor_id in sensor_ids:
+                for sensor_id in actual_sensor_ids:
                     self.berthing_mode_center_stats.pop(sensor_id, None)
                     self.vessel_speed_calculators.pop(sensor_id, None)
 
@@ -2395,6 +2426,7 @@ class LidarManager:
                 "sync_quality": "none" if not self.sync_coordinator_active else "high",
                 "disconnected_sensors": disconnected_sensors,
                 "failed_sensors": failed_sensors,
+                "skipped_sensors": skipped_sensors,
                 "network_issues": network_issues,
                 "warning": "If ethernet was disconnected during disable, LiDAR hardware may still be spinning. Reconnect ethernet and disable again to ensure complete shutdown." if network_issues else None
             }
@@ -2697,14 +2729,20 @@ class LidarManager:
                 logger.error(f"Failed to stop database streaming for berth {berth_id}: {db_err}")
 
             # Step 4: Return comprehensive result
+            # Success is based on whether the sensors for this berth were successfully disabled,
+            # not on whether berthing mode is globally inactive (which would fail when multiple berths are active)
+            sensors_successfully_disabled = len(berthing_result.get("disconnected_sensors", []))
+            sensors_failed = len(berthing_result.get("failed_sensors", []))
+            berth_success = sensors_successfully_disabled > 0 and sensors_failed == 0
+
             result = {
-                "success": not berthing_result.get("active", True),  # Success if berthing is no longer active
+                "success": berth_success,  # Success if sensors for this berth were disabled
                 "berth_id": berth_id,
                 "lasers_found": laser_data,
                 "sensor_ids": sensor_ids,
                 "berthing_result": berthing_result,
                 "db_streaming_stopped": db_streaming_stopped,
-                "message": f"Berthing mode {'deactivated' if not berthing_result.get('active', True) else 'deactivation failed'} for berth {berth_id}"
+                "message": f"Berth {berth_id} {'deactivated successfully' if berth_success else 'deactivation failed'}: {sensors_successfully_disabled} sensors stopped, {sensors_failed} failed"
             }
 
             logger.info(f"Berth {berth_id} deactivation result: {result['message']}")
