@@ -11,6 +11,7 @@ from ...services.lidar_manager import lidar_manager
 from ...core.logging_config import logger
 from ...services.db_streamer_service import db_streamer_service
 from ...models.lidar import OperationResponse, StartOperationRequest, OperationType
+from ...core.http_utils import get_lasers_by_berth
 
 router = APIRouter()
 
@@ -323,7 +324,6 @@ async def get_berth_sensors_status(berth_id: int):
         - streaming_count: Number of sensors currently streaming
         - berthing_mode_count: Number of sensors in berthing mode
     """
-    import httpx
     from ...core.config import settings
 
     try:
@@ -332,14 +332,7 @@ async def get_berth_sensors_status(berth_id: int):
         # Step 1: Query database for lasers associated with this berth via PostgREST
         logger.info(f"Querying database for lasers associated with berth {berth_id}")
 
-        postgrest_url = f"{settings.DB_HOST}/rpc/get_lasers_by_berth"
-        headers = {'Content-Type': 'application/json'}
-        payload = {"p_berth_id": berth_id}
-
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(postgrest_url, headers=headers, json=payload)
-            response.raise_for_status()
-            laser_data = response.json()
+        laser_data = await get_lasers_by_berth(berth_id, settings.DB_HOST)
 
         if not laser_data:
             logger.warning(f"No lasers found for berth {berth_id}")
@@ -431,18 +424,25 @@ async def get_berth_sensors_status(berth_id: int):
         logger.info(f"Successfully retrieved sensor status for berth {berth_id}: {len(sensor_ids)} sensors, {connected_count} connected, {streaming_count} streaming")
         return result
 
-    except httpx.RequestError as req_err:
-        logger.exception(f"Network error querying lasers for berth {berth_id}: {req_err}")
-        raise HTTPException(
-            status_code=503,
-            detail=f"Database connection error for berth {berth_id}: {str(req_err)}"
-        )
-    except httpx.HTTPStatusError as http_err:
-        logger.exception(f"PostgREST error querying lasers for berth {berth_id}: {http_err.response.status_code} - {http_err.response.text}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Database query error for berth {berth_id}: {http_err.response.status_code}"
-        )
+    except Exception as e:
+        if isinstance(e, httpx.RequestError):
+            logger.exception(f"Network error querying lasers for berth {berth_id}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Database connection error for berth {berth_id}: {str(e)}"
+            )
+        elif isinstance(e, httpx.HTTPStatusError):
+            logger.exception(f"PostgREST error querying lasers for berth {berth_id}: {e.response.status_code} - {e.response.text}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Database query error for berth {berth_id}: {e.response.status_code}"
+            )
+        else:
+            logger.exception(f"Error getting sensor status for berth {berth_id}: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Internal error getting sensor status for berth {berth_id}: {str(e)}"
+            )
     except Exception as e:
         logger.error(f"Error getting sensor status for berth {berth_id}: {str(e)}")
         raise HTTPException(

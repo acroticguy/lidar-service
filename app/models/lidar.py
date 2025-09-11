@@ -28,10 +28,10 @@ class CoordinateSystem(str, Enum):
 
 
 class LidarConnectionRequest(BaseModel):
-    computer_ip: str = Field(..., description="Computer IP address")
-    sensor_ip: str = Field(..., description="Sensor IP address")
-    data_port: int = Field(..., description="Data port number")
-    cmd_port: int = Field(..., description="Command port number")
+    computer_ip: Optional[str] = Field(None, description="Computer IP address (optional for reconnection)")
+    sensor_ip: Optional[str] = Field(None, description="Sensor IP address (optional for reconnection)")
+    data_port: Optional[int] = Field(None, description="Data port number (optional for reconnection)")
+    cmd_port: Optional[int] = Field(None, description="Command port number (optional for reconnection)")
     imu_port: Optional[int] = Field(None, description="IMU port number")
     sensor_name: Optional[str] = Field(None, description="Custom sensor name")
 

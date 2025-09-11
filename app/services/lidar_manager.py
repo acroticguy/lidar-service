@@ -9,6 +9,7 @@ import time
 import base64
 import math
 from typing import Dict, List, Optional, Any
+from ..core.packet_parser import parse_livox_packet
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../openpylivox-master'))
 
@@ -316,30 +317,53 @@ class LidarManager:
                     sensor_id = f"SIM{self.next_fake_sensor_number:04d}"
                     self.next_fake_sensor_number += 1
 
+                # Allow reconnection of previously connected fake sensors
                 if sensor_id in self.sensors:
                     logger.warning(f"Fake sensor {sensor_id} already connected")
                     return False, sensor_id
 
+                # For reconnection, try to reuse stored ports if available
+                stored_params = None
+                if sensor_id in self.sensor_info and self.sensor_info[sensor_id].connection_parameters:
+                    stored_params = self.sensor_info[sensor_id].connection_parameters
+                    logger.info(f"Found stored parameters for fake sensor {sensor_id}, attempting to reuse ports")
+
                 # Generate unique ports if not provided
                 if data_port is None:
-                    # Find an available port starting from 56001
-                    data_port = 56001
-                    max_attempts = 100  # Prevent infinite loop
-                    attempts = 0
-                    while self._is_port_in_use(data_port) and attempts < max_attempts:
-                        data_port += 10
-                        attempts += 1
-                    if attempts >= max_attempts:
-                        logger.error(f"Could not find available data port after {max_attempts} attempts")
-                        return False, sensor_id
+                    if stored_params and stored_params.get("data_port"):
+                        # Try to reuse the stored port first
+                        data_port = int(stored_params["data_port"])
+                        if self._is_port_in_use(data_port):
+                            logger.info(f"Stored data port {data_port} in use, finding new port")
+                            data_port = None
+
+                    if data_port is None:
+                        # Find an available port starting from 56001
+                        data_port = 56001
+                        max_attempts = 100  # Prevent infinite loop
+                        attempts = 0
+                        while self._is_port_in_use(data_port) and attempts < max_attempts:
+                            data_port += 10
+                            attempts += 1
+                        if attempts >= max_attempts:
+                            logger.error(f"Could not find available data port after {max_attempts} attempts")
+                            return False, sensor_id
                     logger.info(f"[DEBUG] Assigned data_port: {data_port} for sensor {sensor_id}")
 
                 if cmd_port is None:
-                    cmd_port = data_port - 1  # cmd_port is usually data_port - 1
-                    # Also check if cmd_port is available
-                    if self._is_port_in_use(cmd_port):
-                        logger.error(f"Command port {cmd_port} is already in use")
-                        return False, sensor_id
+                    if stored_params and stored_params.get("cmd_port"):
+                        # Try to reuse the stored command port
+                        cmd_port = int(stored_params["cmd_port"])
+                        if self._is_port_in_use(cmd_port):
+                            logger.info(f"Stored cmd port {cmd_port} in use, finding new port")
+                            cmd_port = None
+
+                    if cmd_port is None:
+                        cmd_port = data_port - 1  # cmd_port is usually data_port - 1
+                        # Also check if cmd_port is available
+                        if self._is_port_in_use(cmd_port):
+                            logger.error(f"Command port {cmd_port} is already in use")
+                            return False, sensor_id
                     logger.info(f"[DEBUG] Assigned cmd_port: {cmd_port} for sensor {sensor_id}")
 
                 # Use sensor_id as the serial number (they should be the same)
@@ -348,8 +372,25 @@ class LidarManager:
                 # Create fake lidar simulator with the sensor_id as serial
                 fake_sensor = FakeLidarSimulator(showMessages=True, serial_number=serial_number)
 
-                # Connect the fake sensor
-                connected = fake_sensor.connect(computer_ip, sensor_ip, data_port, cmd_port, imu_port)
+                # Connect the fake sensor with retry mechanism for port binding
+                connected = False
+                connection_attempts = 0
+                max_connection_attempts = 3
+
+                while not connected and connection_attempts < max_connection_attempts:
+                    try:
+                        connected = fake_sensor.connect(computer_ip, sensor_ip, data_port, cmd_port, imu_port)
+                        if not connected:
+                            connection_attempts += 1
+                            if connection_attempts < max_connection_attempts:
+                                logger.info(f"Connection attempt {connection_attempts} failed for {sensor_id}, retrying in 0.5s...")
+                                time.sleep(0.5)  # Wait for ports to be released
+                    except Exception as conn_err:
+                        connection_attempts += 1
+                        logger.warning(f"Connection attempt {connection_attempts} failed with error: {conn_err}")
+                        if connection_attempts < max_connection_attempts:
+                            logger.info(f"Retrying connection for {sensor_id} in 0.5s...")
+                            time.sleep(0.5)
 
                 if connected:
                     # Store the fake sensor
@@ -570,30 +611,40 @@ class LidarManager:
                         direct.disconnect()
                         del self.direct_controllers[sensor_id]
 
-                    # Disconnect OpenPyLivox if it exists
+                    # Disconnect sensor based on type
                     if sensor_id in self.sensors:
                         sensor = self.sensors[sensor_id]
                         try:
-                            # Find and stop all monitoring threads
-                            import threading
-                            for thread in threading.enumerate():
-                                if hasattr(thread, '_target') and thread._target:
-                                    # Check if it's the problematic monitoring thread
-                                    if 'openpylivox' in str(thread._target):
-                                        logger.debug(f"Found OpenPyLivox thread: {thread.name}")
-                                        # Try to stop it gracefully
-                                        if hasattr(thread, '_args') and thread._args:
-                                            try:
-                                                obj = thread._args[0]
-                                                if hasattr(obj, 'started'):
-                                                    obj.started = False
-                                                if hasattr(obj, 't_socket'):
-                                                    obj.t_socket.close()
-                                            except:
-                                                pass
+                            # Check if this is a fake sensor
+                            is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
 
-                            sensor.disconnect()
-                        except:
+                            if is_fake:
+                                # For fake sensors, call their disconnect method directly
+                                logger.info(f"Disconnecting fake sensor {sensor_id}")
+                                sensor.disconnect()
+                            else:
+                                # For real sensors, use OpenPyLivox disconnect
+                                # Find and stop all monitoring threads
+                                import threading
+                                for thread in threading.enumerate():
+                                    if hasattr(thread, '_target') and thread._target:
+                                        # Check if it's the problematic monitoring thread
+                                        if 'openpylivox' in str(thread._target):
+                                            logger.debug(f"Found OpenPyLivox thread: {thread.name}")
+                                            # Try to stop it gracefully
+                                            if hasattr(thread, '_args') and thread._args:
+                                                try:
+                                                    obj = thread._args[0]
+                                                    if hasattr(obj, 'started'):
+                                                        obj.started = False
+                                                    if hasattr(obj, 't_socket'):
+                                                        obj.t_socket.close()
+                                                except:
+                                                    pass
+
+                                sensor.disconnect()
+                        except Exception as disc_err:
+                            logger.error(f"Error disconnecting sensor {sensor_id}: {disc_err}")
                             pass
 
                     del self.sensors[sensor_id]
@@ -601,8 +652,18 @@ class LidarManager:
                     del self.command_queues[sensor_id]
                     del self.stream_active[sensor_id]
 
+                    # For fake sensors, preserve sensor_info for potential reconnection
                     if sensor_id in self.sensor_info:
-                        self.sensor_info[sensor_id].status = LidarStatus.DISCONNECTED
+                        sensor_info = self.sensor_info[sensor_id]
+                        # Check if this is a fake sensor by checking the sensor object itself
+                        is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
+                        if is_fake:
+                            # Keep sensor info for fake sensors so they can be reconnected
+                            sensor_info.status = LidarStatus.DISCONNECTED
+                            logger.info(f"Preserved sensor info for fake sensor {sensor_id} for potential reconnection")
+                        else:
+                            # Remove sensor info for real sensors
+                            del self.sensor_info[sensor_id]
 
                     logger.info(f"Fully disconnected sensor {sensor_id}")
                 else:
@@ -648,12 +709,14 @@ class LidarManager:
                 if is_fake:
                     cmd_port = sensor._cmdPort
                     target_ip = sensor._computerIP  # Send to computer IP where socket is bound
+                    logger.info(f"Starting stream for fake sensor {sensor_id}, target_ip={target_ip}, cmd_port={cmd_port}")
                 else:
                     cmd_port = 65000  # Use the standard command port for real sensors
                     target_ip = sensor._sensorIP
 
                 try:
                     sensor._cmdSocket.sendto(sensor._CMD_DATA_START, (target_ip, cmd_port))
+                    logger.info(f"Sent DATA_START to {sensor_id} at {target_ip}:{cmd_port}")
                     sensor._isData = True
                 except Exception as cmd_err:
                     logger.error(f"Start stream {sensor_id}: Failed to send DATA_START command: {cmd_err}")
@@ -811,8 +874,7 @@ class LidarManager:
         points_parsed = 0
         last_log = time.time()
 
-        # Import struct for parsing
-        import struct
+        # Import math for calculations
         import math
 
         # Smart laser distance meter - find the TRUE center beam
@@ -871,240 +933,18 @@ class LidarManager:
                         if packets_received <= 5:
                             logger.debug(f"Packet {packets_received}: size={len(data)} bytes")
 
-                        # Parse Livox packet based on OpenPyLivox structure
-                        # Packet structure:
-                        # - Byte 0: Version (should be 5)
-                        # - Byte 1: Slot ID
-                        # - Byte 2: Lidar ID
-                        # - Byte 3: Reserved
-                        # - Bytes 4-7: Status
-                        # - Byte 8: Timestamp type
-                        # - Byte 9: Data type (0=Cartesian, 1=Spherical)
-                        # - Bytes 10-17: Timestamp
-                        # - Bytes 18+: Point data (100 points, 13 bytes each)
+                        # Use the shared packet parser
+                        parsed_points = parse_livox_packet(data)
 
-                        # Log first few packets for debugging
+                        # Log packet info for debugging
                         if packets_received <= 5:
-                            logger.info(f"Packet {packets_received}: size={len(data)}, first bytes={data[:20].hex() if len(data) >= 20 else data.hex()}")
+                            logger.info(f"Packet {packets_received}: size={len(data)}, parsed {len(parsed_points)} points")
 
-                        if len(data) >= 18:  # Minimum header size
-                            # Check packet version
-                            version = struct.unpack('B', data[0:1])[0]
-                            data_type = struct.unpack('B', data[9:10])[0] if len(data) > 9 else -1
-
-                            # Log packet structure
-                            if packets_received <= 5:
-                                logger.debug(f"Packet structure: version={version}, data_type={data_type}")
-                                # Log first few data values to debug
-                                if len(data) >= 30:
-                                    test_x = struct.unpack('<i', data[18:22])[0]
-                                    test_y = struct.unpack('<i', data[22:26])[0]
-                                    test_z = struct.unpack('<i', data[26:30])[0]
-                                    logger.debug(f"First point raw values: x={test_x}, y={test_y}, z={test_z}")
-
-                            # Handle different data types
-                            if version == 5 and data_type == 0:  # Version 5, Cartesian single return (Mid-40/100)
-                                # Parse all 100 points starting at byte 18
-                                byte_pos = 18
-                                points_in_packet = 0
-
-                                for i in range(100):
-                                    if byte_pos + 13 > len(data):
-                                        break
-
-                                    # Parse point data
-                                    x_mm = struct.unpack('<i', data[byte_pos:byte_pos+4])[0]
-                                    y_mm = struct.unpack('<i', data[byte_pos+4:byte_pos+8])[0]
-                                    z_mm = struct.unpack('<i', data[byte_pos+8:byte_pos+12])[0]
-                                    intensity = struct.unpack('B', data[byte_pos+12:byte_pos+13])[0]
-
-                                    # OpenPyLivox checks Y coordinate for null points
-                                    # Also filter out invalid values
-                                    if y_mm != 0 and -500000 <= x_mm <= 500000 and -500000 <= y_mm <= 500000 and -500000 <= z_mm <= 500000:
-                                        x_m = x_mm / 1000.0
-                                        y_m = y_mm / 1000.0
-                                        z_m = z_mm / 1000.0
-                                        distance = (x_m**2 + y_m**2 + z_m**2)**0.5
-
-                                        # Center detection now happens after all points are collected
-
-                                        point_cloud_data.append({
-                                            "point_id": points_parsed,
-                                            "x": round(x_m, 3),
-                                            "y": round(y_m, 3),
-                                            "z": round(z_m, 3),
-                                            "distance": round(distance, 3),
-                                            "intensity": intensity
-                                        })
-                                        points_parsed += 1
-                                        points_in_packet += 1
-
-                                    byte_pos += 13
-
-                                # Log if we got fewer points than expected
-                                if points_in_packet < 90 and packets_this_second < 10:
-                                    logger.info(f"Packet had {points_in_packet} valid points out of 100")
-
-                            elif version == 5 and data_type == 2:  # Tele-15 Cartesian single return
-                                # Parse 96 points with 14 bytes each
-                                byte_pos = 18
-                                points_in_packet = 0
-
-                                for i in range(96):
-                                    if byte_pos + 14 > len(data):
-                                        break
-
-                                    # Parse point data (14 bytes)
-                                    x_mm = struct.unpack('<i', data[byte_pos:byte_pos+4])[0]
-                                    y_mm = struct.unpack('<i', data[byte_pos+4:byte_pos+8])[0]
-                                    z_mm = struct.unpack('<i', data[byte_pos+8:byte_pos+12])[0]
-                                    intensity = struct.unpack('B', data[byte_pos+12:byte_pos+13])[0]
-                                    # byte_pos+13 has tag bits
-
-                                    # Check Y for null points
-                                    if y_mm != 0 and -500000 <= x_mm <= 500000 and -500000 <= y_mm <= 500000 and -500000 <= z_mm <= 500000:
-                                        x_m = x_mm / 1000.0
-                                        y_m = y_mm / 1000.0
-                                        z_m = z_mm / 1000.0
-                                        distance = (x_m**2 + y_m**2 + z_m**2)**0.5
-
-                                        # Center detection now happens after all points are collected
-
-                                        point_cloud_data.append({
-                                            "point_id": points_parsed,
-                                            "x": round(x_m, 3),
-                                            "y": round(y_m, 3),
-                                            "z": round(z_m, 3),
-                                            "distance": round(distance, 3),
-                                            "intensity": intensity
-                                        })
-                                        points_parsed += 1
-                                        points_in_packet += 1
-
-                                    byte_pos += 14
-
-                                # Log parsing success for first few packets
-                                if packets_this_second < 5 and points_in_packet > 0:
-                                    logger.debug(f"Tele-15 single return packet had {points_in_packet} valid points")
-
-                            elif version == 5 and data_type == 4:  # Tele-15 Cartesian dual return
-                                # Parse 48 points with dual return (28 bytes each)
-                                byte_pos = 18
-                                points_in_packet = 0
-
-                                for i in range(48):  # 48 points for dual return
-                                    if byte_pos + 28 > len(data):
-                                        break
-
-                                    # First return (14 bytes)
-                                    x1_mm = struct.unpack('<i', data[byte_pos:byte_pos+4])[0]
-                                    y1_mm = struct.unpack('<i', data[byte_pos+4:byte_pos+8])[0]
-                                    z1_mm = struct.unpack('<i', data[byte_pos+8:byte_pos+12])[0]
-                                    intensity1 = struct.unpack('B', data[byte_pos+12:byte_pos+13])[0]
-                                    # byte_pos+13 has additional metadata
-
-                                    # Second return (14 bytes)
-                                    x2_mm = struct.unpack('<i', data[byte_pos+14:byte_pos+18])[0]
-                                    y2_mm = struct.unpack('<i', data[byte_pos+18:byte_pos+22])[0]
-                                    z2_mm = struct.unpack('<i', data[byte_pos+22:byte_pos+26])[0]
-                                    intensity2 = struct.unpack('B', data[byte_pos+26:byte_pos+27])[0]
-
-                                    # Check first return
-                                    if y1_mm != 0 and -500000 <= x1_mm <= 500000 and -500000 <= y1_mm <= 500000 and -500000 <= z1_mm <= 500000:
-                                        x1_m = x1_mm / 1000.0
-                                        y1_m = y1_mm / 1000.0
-                                        z1_m = z1_mm / 1000.0
-                                        distance1 = (x1_m**2 + y1_m**2 + z1_m**2)**0.5
-
-                                        # Center detection now happens after all points are collected
-
-                                        point_cloud_data.append({
-                                            "point_id": points_parsed,
-                                            "x": round(x1_m, 3),
-                                            "y": round(y1_m, 3),
-                                            "z": round(z1_m, 3),
-                                            "distance": round(distance1, 3),
-                                            "intensity": intensity1,
-                                            "return_num": 1
-                                        })
-                                        points_parsed += 1
-                                        points_in_packet += 1
-
-                                    # Check second return
-                                    if y2_mm != 0 and -500000 <= x2_mm <= 500000 and -500000 <= y2_mm <= 500000 and -500000 <= z2_mm <= 500000:
-                                        x2_m = x2_mm / 1000.0
-                                        y2_m = y2_mm / 1000.0
-                                        z2_m = z2_mm / 1000.0
-                                        distance2 = (x2_m**2 + y2_m**2 + z2_m**2)**0.5
-
-                                        # Center detection now happens after all points are collected
-
-                                        point_cloud_data.append({
-                                            "point_id": points_parsed,
-                                            "x": round(x2_m, 3),
-                                            "y": round(y2_m, 3),
-                                            "z": round(z2_m, 3),
-                                            "distance": round(distance2, 3),
-                                            "intensity": intensity2,
-                                            "return_num": 2
-                                        })
-                                        points_parsed += 1
-                                        points_in_packet += 1
-
-                                    byte_pos += 28
-
-                                # Log parsing success for first few packets
-                                if packets_this_second < 5 and points_in_packet > 0:
-                                    logger.debug(f"Dual return packet had {points_in_packet} valid points")
-
-                            else:
-                                # Log unhandled packet types
-                                if packets_received <= 10:
-                                    logger.debug(f"Unhandled packet type: version={version}, data_type={data_type}, size={len(data)}")
-
-                                # Try alternative parsing for smaller packets
-                                if len(data) >= 1214 and packets_received <= 10:  # Slightly smaller packet
-                                    logger.debug(f"Trying alternative parsing for packet size {len(data)}")
-                                    # The packet might not have the full header, try direct point parsing
-                                    # Livox packets might start data at different offsets
-                                    for start_offset in [0, 14, 18, 42, 60]:
-                                        if start_offset + 1300 <= len(data):
-                                            # Try to parse first point to validate offset
-                                            test_y = struct.unpack('<i', data[start_offset+4:start_offset+8])[0] if start_offset + 8 <= len(data) else 0
-                                            if test_y != 0 and -500000 <= test_y <= 500000:
-                                                logger.debug(f"Found valid data at offset {start_offset}, Y={test_y}")
-                                                # Parse points from this offset
-                                                byte_pos = start_offset
-                                                for i in range(100):
-                                                    if byte_pos + 13 > len(data):
-                                                        break
-
-                                                    x_mm = struct.unpack('<i', data[byte_pos:byte_pos+4])[0]
-                                                    y_mm = struct.unpack('<i', data[byte_pos+4:byte_pos+8])[0]
-                                                    z_mm = struct.unpack('<i', data[byte_pos+8:byte_pos+12])[0]
-                                                    intensity = struct.unpack('B', data[byte_pos+12:byte_pos+13])[0]
-
-                                                    if y_mm != 0 and -500000 <= x_mm <= 500000 and -500000 <= y_mm <= 500000 and -500000 <= z_mm <= 500000:
-                                                        x_m = x_mm / 1000.0
-                                                        y_m = y_mm / 1000.0
-                                                        z_m = z_mm / 1000.0
-                                                        distance = (x_m**2 + y_m**2 + z_m**2)**0.5
-
-                                                        # This point will be added to general point cloud
-                                                        # Center detection happens later
-
-                                                        point_cloud_data.append({
-                                                            "point_id": points_parsed,
-                                                            "x": round(x_m, 3),
-                                                            "y": round(y_m, 3),
-                                                            "z": round(z_m, 3),
-                                                            "distance": round(distance, 3),
-                                                            "intensity": intensity
-                                                        })
-                                                        points_parsed += 1
-
-                                                    byte_pos += 13
-                                                break
+                        # Add parsed points to point cloud data
+                        for point in parsed_points:
+                            point["point_id"] = points_parsed
+                            point_cloud_data.append(point)
+                            points_parsed += 1
 
                     except socket.timeout:
                         continue
@@ -1377,8 +1217,7 @@ class LidarManager:
             "ready_for_sync": False
         }
 
-        # Import struct for parsing
-        import struct
+        # Import math for calculations
         import math
 
         # Speed calculation variables
@@ -1402,116 +1241,13 @@ class LidarManager:
                         data, addr = sock.recvfrom(65536)
                         packets_this_collection += 1
 
-                        # Parse Livox packet based on version and data type (same logic as before)
-                        if len(data) >= 18:
-                            version = struct.unpack('B', data[0:1])[0]
-                            data_type = struct.unpack('B', data[9:10])[0] if len(data) > 9 else -1
+                        # Use the shared packet parser
+                        parsed_points = parse_livox_packet(data)
 
-                            if version == 5 and data_type == 0:  # Mid-40/100 Cartesian single return
-                                byte_pos = 18
-                                for i in range(100):
-                                    if byte_pos + 13 > len(data):
-                                        break
-                                    x_mm = struct.unpack('<i', data[byte_pos:byte_pos+4])[0]
-                                    y_mm = struct.unpack('<i', data[byte_pos+4:byte_pos+8])[0]
-                                    z_mm = struct.unpack('<i', data[byte_pos+8:byte_pos+12])[0]
-                                    intensity = struct.unpack('B', data[byte_pos+12:byte_pos+13])[0]
-
-                                    if y_mm != 0 and -500000 <= x_mm <= 500000 and -500000 <= y_mm <= 500000 and -500000 <= z_mm <= 500000:
-                                        x_m = x_mm / 1000.0
-                                        y_m = y_mm / 1000.0
-                                        z_m = z_mm / 1000.0
-                                        # Distance from LiDAR origin (sensor coordinate system O-XYZ)
-                                        lidar_distance = (x_m**2 + y_m**2 + z_m**2)**0.5
-
-                                        collected_points.append({
-                                            "x": round(x_m, 3),
-                                            "y": round(y_m, 3),
-                                            "z": round(z_m, 3),
-                                            "distance": round(lidar_distance, 3),  # Distance from LiDAR origin
-                                            "intensity": intensity,
-                                            "collection_time": current_time
-                                        })
-                                    byte_pos += 13
-
-                            elif version == 5 and data_type == 2:  # Tele-15 single return
-                                byte_pos = 18
-                                for i in range(96):
-                                    if byte_pos + 14 > len(data):
-                                        break
-                                    x_mm = struct.unpack('<i', data[byte_pos:byte_pos+4])[0]
-                                    y_mm = struct.unpack('<i', data[byte_pos+4:byte_pos+8])[0]
-                                    z_mm = struct.unpack('<i', data[byte_pos+8:byte_pos+12])[0]
-                                    intensity = struct.unpack('B', data[byte_pos+12:byte_pos+13])[0]
-
-                                    if y_mm != 0 and -500000 <= x_mm <= 500000 and -500000 <= y_mm <= 500000 and -500000 <= z_mm <= 500000:
-                                        x_m = x_mm / 1000.0
-                                        y_m = y_mm / 1000.0
-                                        z_m = z_mm / 1000.0
-                                        # Distance from LiDAR origin (sensor coordinate system O-XYZ)
-                                        lidar_distance = (x_m**2 + y_m**2 + z_m**2)**0.5
-
-                                        collected_points.append({
-                                            "x": round(x_m, 3),
-                                            "y": round(y_m, 3),
-                                            "z": round(z_m, 3),
-                                            "distance": round(lidar_distance, 3),  # Distance from LiDAR origin
-                                            "intensity": intensity,
-                                            "collection_time": current_time
-                                        })
-                                    byte_pos += 14
-
-                            elif version == 5 and data_type == 4:  # Tele-15 dual return
-                                byte_pos = 18
-                                for i in range(48):
-                                    if byte_pos + 28 > len(data):
-                                        break
-                                    # First return
-                                    x1_mm = struct.unpack('<i', data[byte_pos:byte_pos+4])[0]
-                                    y1_mm = struct.unpack('<i', data[byte_pos+4:byte_pos+8])[0]
-                                    z1_mm = struct.unpack('<i', data[byte_pos+8:byte_pos+12])[0]
-                                    intensity1 = struct.unpack('B', data[byte_pos+12:byte_pos+13])[0]
-
-                                    if y1_mm != 0 and -500000 <= x1_mm <= 500000 and -500000 <= y1_mm <= 500000 and -500000 <= z1_mm <= 500000:
-                                        x1_m = x1_mm / 1000.0
-                                        y1_m = y1_mm / 1000.0
-                                        z1_m = z1_mm / 1000.0
-                                        # Distance from LiDAR origin (sensor coordinate system O-XYZ)
-                                        lidar_distance1 = (x1_m**2 + y1_m**2 + z1_m**2)**0.5
-
-                                        collected_points.append({
-                                            "x": round(x1_m, 3),
-                                            "y": round(y1_m, 3),
-                                            "z": round(z1_m, 3),
-                                            "distance": round(lidar_distance1, 3),  # Distance from LiDAR origin
-                                            "intensity": intensity1,
-                                            "return_num": 1,
-                                            "collection_time": current_time
-                                        })
-
-                                    # Second return
-                                    x2_mm = struct.unpack('<i', data[byte_pos+14:byte_pos+18])[0]
-                                    y2_mm = struct.unpack('<i', data[byte_pos+18:byte_pos+22])[0]
-                                    z2_mm = struct.unpack('<i', data[byte_pos+22:byte_pos+26])[0]
-                                    intensity2 = struct.unpack('B', data[byte_pos+26:byte_pos+27])[0]
-
-                                    if y2_mm != 0 and -500000 <= x2_mm <= 500000 and -500000 <= y2_mm <= 500000 and -500000 <= z2_mm <= 500000:
-                                        x2_m = x2_mm / 1000.0
-                                        y2_m = y2_mm / 1000.0
-                                        z2_m = z2_mm / 1000.0
-                                        # Distance from LiDAR origin (sensor coordinate system O-XYZ)
-                                        lidar_distance2 = (x2_m**2 + y2_m**2 + z2_m**2)**0.5
-
-                                        collected_points.append({
-                                            "x": round(x2_m, 3),
-                                            "y": round(y2_m, 3),
-                                            "z": round(z2_m, 3),
-                                            "distance": round(lidar_distance2, 3),  # Distance from LiDAR origin
-                                            "intensity": intensity2,
-                                            "return_num": 2,
-                                            "collection_time": current_time
-                                        })
-                                    byte_pos += 28
+                        # Add collection time to each point
+                        for point in parsed_points:
+                            point["collection_time"] = current_time
+                            collected_points.append(point)
 
                     except socket.timeout:
                         continue
@@ -2024,12 +1760,16 @@ class LidarManager:
             try:
                 conn_params = sensor.connectionParameters()
                 if conn_params:
+                    # Preserve existing connection parameters (like is_simulation flag)
+                    existing_params = info.connection_parameters or {}
                     info.connection_parameters = {
                         "computer_ip": conn_params[0],
                         "sensor_ip": conn_params[1],
                         "data_port": conn_params[2],
                         "cmd_port": conn_params[3]
                     }
+                    # Merge with existing parameters to preserve flags like is_simulation
+                    info.connection_parameters.update(existing_params)
             except Exception:
                 pass
 

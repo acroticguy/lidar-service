@@ -6,6 +6,10 @@ import random
 import math
 from typing import Optional
 from ..core.logging_config import logger
+from ..core.constants import (
+    _CMD_DATA_START, _CMD_DATA_STOP, _CMD_LIDAR_SPIN_UP,
+    _CMD_LIDAR_SPIN_DOWN, _CMD_CARTESIAN_CS, _CMD_GET_DEVICE_INFO
+)
 
 class FakeLidarSimulator:
     """Simulates a Livox lidar for testing purposes"""
@@ -33,6 +37,13 @@ class FakeLidarSimulator:
         self._running = False
         self._command_thread = None
         self._command_running = False
+        # Command constants
+        self._CMD_DATA_START = _CMD_DATA_START
+        self._CMD_DATA_STOP = _CMD_DATA_STOP
+        self._CMD_LIDAR_SPIN_UP = _CMD_LIDAR_SPIN_UP
+        self._CMD_LIDAR_SPIN_DOWN = _CMD_LIDAR_SPIN_DOWN
+        self._CMD_CARTESIAN_CS = _CMD_CARTESIAN_CS
+        self._CMD_GET_DEVICE_INFO = _CMD_GET_DEVICE_INFO
 
     def connect(self, computerIP, sensorIP, dataPort, cmdPort, imuPort=None, sensor_name_override=""):
         """Simulate connection to fake lidar"""
@@ -58,11 +69,13 @@ class FakeLidarSimulator:
             self._dataSocket.bind((computerIP, dataPort))
             if self._showMessages:
                 logger.info(f"Fake Lidar: Successfully bound data socket to ({computerIP}, {dataPort})")
+            logger.info(f"Fake Lidar {self._serial}: data socket bound to {self._dataSocket.getsockname()}")
 
             # Use the provided cmdPort instead of hardcoded 65000
             self._cmdSocket.bind((computerIP, cmdPort))
             if self._showMessages:
                 logger.info(f"Fake Lidar: Successfully bound cmd socket to ({computerIP}, {cmdPort})")
+            logger.info(f"Fake Lidar {self._serial}: cmd socket bound to {self._cmdSocket.getsockname()}")
 
             # Set back to blocking mode for normal operation
             self._dataSocket.setblocking(True)
@@ -122,6 +135,7 @@ class FakeLidarSimulator:
         """Start fake data streaming"""
         if self._showMessages:
             logger.info("Fake Lidar: dataStart_RT_B() called")
+        logger.info(f"Fake Lidar {self._serial}: dataStart_RT_B called")
 
         if not self._isConnected:
             if self._showMessages:
@@ -139,12 +153,6 @@ class FakeLidarSimulator:
         if self._showMessages:
             logger.info("Fake Lidar: Data streaming thread started")
 
-    # Add command constants that match OpenPyLivox exactly
-    _CMD_DATA_START = bytes.fromhex('AA011000000000B809000401228D5307')
-    _CMD_DATA_STOP = bytes.fromhex('AA011000000000B809000400B4BD5470')
-    _CMD_LIDAR_SPIN_UP = bytes.fromhex('AA011000000000B809000201E09941F1')
-    _CMD_LIDAR_SPIN_DOWN = bytes.fromhex('AA011000000000B80900020062B94546')
-    _CMD_CARTESIAN_CS = bytes.fromhex('AA011000000000B809000500F58C4F69')
 
     def dataStop(self):
         """Stop fake data streaming"""
@@ -158,6 +166,7 @@ class FakeLidarSimulator:
 
     def _generate_fake_data(self):
         """Generate and send fake lidar data packets"""
+        logger.info(f"Fake Lidar {self._serial}: fake data generation started")
         packet_count = 0
 
         while self._running and self._isData:
@@ -251,6 +260,7 @@ class FakeLidarSimulator:
                 # Listen for commands with timeout
                 self._cmdSocket.settimeout(0.1)
                 data, addr = self._cmdSocket.recvfrom(1024)
+                logger.info(f"Fake Lidar {self._serial}: received {len(data)} bytes from {addr}")
 
                 # Check if this is a data start command (use full command length)
                 if len(data) >= len(self._CMD_DATA_START) and data == self._CMD_DATA_START:

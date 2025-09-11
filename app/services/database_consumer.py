@@ -7,6 +7,7 @@ from typing import List, Dict, Any
 from ..core.config import settings
 from ..core.logging_config import logger
 from .berthing_data_core import fetch_berthing_data_for_sensor
+from ..core.http_utils import SharedHTTPClient
 
 class DatabaseConsumer:
     def __init__(self, postgrest_url: str):
@@ -20,9 +21,8 @@ class DatabaseConsumer:
         self.stop_event = asyncio.Event()  # Async event for signaling stop
         self.consumer_tasks = {}  # Stores asyncio.Task objects, mapped by sensor_id
         self.fastapi_server = f"http://{settings.HOST}:{settings.PORT}/api/v1"
-        # Shared httpx client to reduce overhead of client creation if many tasks run concurrently
-        # and PostgREST/FastAPI can handle persistent connections well.
-        self.http_client = httpx.AsyncClient(timeout=10)
+        # Shared HTTP client for efficient connection reuse
+        self.http_client = SharedHTTPClient(timeout=10)
 
     async def start_consumer(self, sensor_id: str):
         """Starts an async consumer task for a specific sensor."""
@@ -62,11 +62,8 @@ class DatabaseConsumer:
         """Stops all running consumer tasks and closes the HTTP client."""
         self.stop_event.set()  # Signal all consumer tasks to stop their loops
 
-        # Close the shared httpx client
-        if self.http_client:
-            await self.http_client.aclose()
-            logger.info("HTTPX client closed.")
-            self.http_client = None
+        # The SharedHTTPClient handles its own cleanup
+        logger.info("Database consumers stopped.")
 
         if self.consumer_tasks:
             tasks_to_wait_for = [task for task in self.consumer_tasks.values() if not task.done()]
@@ -109,7 +106,7 @@ class DatabaseConsumer:
                 # Get data from the FastAPI server (assuming this endpoint is fast)
                 logger.debug(f"Attempting to fetch data for sensor {sensor_id} from FastAPI at {berthing_url}...")
                 
-                # Use the shared httpx client
+                # Get data from FastAPI
                 res = await fetch_berthing_data_for_sensor(sensor_id)
                 data = res
 
@@ -134,11 +131,10 @@ class DatabaseConsumer:
                     "p_berthing_id": berthing_id,
                 }
 
-                # Make POST request to PostgREST RPC endpoint (single data point)
-                response = await self.http_client.post(rpc_url, headers=headers, json=payload)
-                response.raise_for_status()  # Raise an error for bad responses (4xx or 5xx)
-                
-                res_json = response.json()
+                # Make POST request to PostgREST RPC endpoint using shared HTTP client
+                async with self.http_client:
+                    response = await self.http_client.post(rpc_url, json=payload)
+                    res_json = response
                 # Assuming the RPC function returns a JSON with a 'success' key
                 if res_json.get('success'):
                     logger.info(f"Data for sensor {sensor_id} at {dt_iso_format} inserted successfully (ID: {res_json.get('id', 'unknown')}).")

@@ -8,6 +8,10 @@ import threading
 import time
 import logging
 from typing import Optional, Tuple, Dict
+from ..core.constants import (
+    _CMD_DATA_START, _CMD_DATA_STOP, _CMD_LIDAR_SPIN_UP,
+    _CMD_LIDAR_SPIN_DOWN, _CMD_CARTESIAN_CS
+)
 
 logger = logging.getLogger('lidar_service')
 
@@ -15,12 +19,6 @@ logger = logging.getLogger('lidar_service')
 class DirectLidarController:
     """Direct control of Livox LiDAR without OpenPyLivox's monitoring issues"""
     
-    # Livox command definitions
-    _CMD_LIDAR_SPIN_UP = bytes.fromhex('AA011000000000B80900020086A93D4E')
-    _CMD_LIDAR_SPIN_DOWN = bytes.fromhex('AA011000000000B809000201E09941F1')
-    _CMD_DATA_START = bytes.fromhex('AA011000000000B809000401228D5307')
-    _CMD_DATA_STOP = bytes.fromhex('AA011000000000B809000400B4BD5470')
-    _CMD_CARTESIAN_CS = bytes.fromhex('AA011000000000B809000500F58C4F69')
     
     def __init__(self, sensor_ip: str, data_port: int, cmd_port: int):
         self.sensor_ip = sensor_ip

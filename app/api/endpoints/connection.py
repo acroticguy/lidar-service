@@ -24,9 +24,97 @@ async def discover_sensors(computer_ip: Optional[str] = Query(None, description=
 
 
 @router.post("/connect/{sensor_id}", response_model=OperationResponse)
-async def connect_sensor(sensor_id: str, request: LidarConnectionRequest):
-    """Connect to a specific sensor"""
+async def connect_sensor(sensor_id: str, request: Optional[LidarConnectionRequest] = None):
+    """Connect to a specific sensor. For fake sensors, can reconnect using same ID if previously connected (no request body needed)."""
     try:
+        # Check if sensor is already connected
+        if sensor_id in lidar_manager.sensors:
+            # Check if it's a fake sensor
+            sensor = lidar_manager.sensors[sensor_id]
+            is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
+
+            if is_fake:
+                # For fake sensors, we can reconnect using stored parameters
+                logger.info(f"Fake sensor {sensor_id} already connected, reconnecting with stored parameters")
+
+                # Get stored connection parameters
+                stored_params = None
+                if sensor_id in lidar_manager.sensor_info and lidar_manager.sensor_info[sensor_id].connection_parameters:
+                    stored_params = lidar_manager.sensor_info[sensor_id].connection_parameters
+
+                if stored_params:
+                    # Disconnect first
+                    await lidar_manager.disconnect_sensor(sensor_id, force=True)
+
+                    # Reconnect using stored parameters
+                    success, _ = await lidar_manager.connect_fake_lidar(
+                        sensor_id=sensor_id,
+                        computer_ip=stored_params.get("computer_ip"),
+                        sensor_ip=stored_params.get("sensor_ip"),
+                        data_port=int(stored_params.get("data_port")) if stored_params.get("data_port") else None,
+                        cmd_port=int(stored_params.get("cmd_port")) if stored_params.get("cmd_port") else None,
+                        imu_port=request.imu_port
+                    )
+
+                    if success:
+                        return OperationResponse(
+                            success=True,
+                            message=f"Successfully reconnected to fake sensor {sensor_id}",
+                            data={"sensor_id": sensor_id, "reconnected": True}
+                        )
+                    else:
+                        raise HTTPException(status_code=400, detail=f"Failed to reconnect fake sensor {sensor_id}")
+                else:
+                    raise HTTPException(status_code=400, detail=f"No stored parameters found for fake sensor {sensor_id}")
+            else:
+                # For real sensors, return already connected message
+                return OperationResponse(
+                    success=True,
+                    message=f"Sensor {sensor_id} is already connected",
+                    data={"sensor_id": sensor_id, "already_connected": True}
+                )
+
+        # Check if this is a previously connected fake sensor (not currently connected)
+        stored_params = None
+        if sensor_id in lidar_manager.sensor_info and lidar_manager.sensor_info[sensor_id].connection_parameters:
+            stored_params = lidar_manager.sensor_info[sensor_id].connection_parameters
+            is_simulation = stored_params.get("is_simulation", False)
+
+            if is_simulation:
+                logger.info(f"Reconnecting previously used fake sensor {sensor_id} with stored parameters")
+                logger.info(f"Stored params: {stored_params}")
+
+                # Validate stored parameters
+                if not stored_params.get("computer_ip") or not stored_params.get("sensor_ip"):
+                    logger.error(f"Invalid stored parameters for {sensor_id}: missing IP addresses")
+                    raise HTTPException(status_code=400, detail=f"Invalid stored parameters for fake sensor {sensor_id}")
+
+                # Reconnect using stored parameters with retry mechanism
+                success, _ = await lidar_manager.connect_fake_lidar(
+                    sensor_id=sensor_id,
+                    computer_ip=stored_params.get("computer_ip"),
+                    sensor_ip=stored_params.get("sensor_ip"),
+                    data_port=int(stored_params.get("data_port")) if stored_params.get("data_port") else None,
+                    cmd_port=int(stored_params.get("cmd_port")) if stored_params.get("cmd_port") else None,
+                    imu_port=getattr(request, 'imu_port', None) if request else None
+                )
+
+                if success:
+                    return OperationResponse(
+                        success=True,
+                        message=f"Successfully reconnected fake sensor {sensor_id} using stored parameters",
+                        data={"sensor_id": sensor_id, "reconnected": True, "from_stored": True}
+                    )
+                else:
+                    logger.error(f"Failed to reconnect fake sensor {sensor_id} - connect_fake_lidar returned False")
+                    raise HTTPException(status_code=400, detail=f"Failed to reconnect fake sensor {sensor_id}")
+        else:
+            logger.info(f"No stored parameters found for sensor {sensor_id}")
+
+        # Normal connection process for new sensors
+        if not request:
+            raise HTTPException(status_code=400, detail="Request body required for new sensor connections")
+
         success = await lidar_manager.connect_sensor(
             sensor_id=sensor_id,
             computer_ip=request.computer_ip,
@@ -36,7 +124,7 @@ async def connect_sensor(sensor_id: str, request: LidarConnectionRequest):
             imu_port=request.imu_port,
             sensor_name=request.sensor_name
         )
-        
+
         if success:
             return OperationResponse(
                 success=True,
@@ -45,7 +133,7 @@ async def connect_sensor(sensor_id: str, request: LidarConnectionRequest):
             )
         else:
             raise HTTPException(status_code=400, detail="Failed to connect to sensor")
-            
+
     except HTTPException:
         raise
     except Exception as e:
@@ -81,15 +169,25 @@ async def auto_connect_all(request: LidarAutoConnectRequest = LidarAutoConnectRe
 async def disconnect_sensor(sensor_id: str):
     """Disconnect a specific sensor"""
     try:
+        # Check if sensor exists first
+        if sensor_id not in lidar_manager.sensors:
+            raise HTTPException(status_code=404, detail=f"Sensor {sensor_id} not found")
+
+        # Check if it's a fake sensor for better messaging
+        sensor = lidar_manager.sensors[sensor_id]
+        is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
+
         success = await lidar_manager.disconnect_sensor(sensor_id, force=True)
 
         if success:
+            sensor_type = "fake sensor" if is_fake else "sensor"
             return OperationResponse(
                 success=True,
-                message=f"Successfully disconnected sensor {sensor_id}"
+                message=f"Successfully disconnected {sensor_type} {sensor_id}",
+                data={"sensor_id": sensor_id, "sensor_type": "fake" if is_fake else "real"}
             )
         else:
-            raise HTTPException(status_code=404, detail="Sensor not found")
+            raise HTTPException(status_code=500, detail=f"Failed to disconnect sensor {sensor_id}")
 
     except HTTPException:
         raise
@@ -104,15 +202,29 @@ async def disconnect_all_sensors():
     try:
         sensors = list(lidar_manager.sensors.keys())
         disconnected = 0
+        fake_disconnected = 0
+        real_disconnected = 0
 
         for sensor_id in sensors:
+            # Check sensor type before disconnecting
+            sensor = lidar_manager.sensors[sensor_id]
+            is_fake = hasattr(sensor, 'is_simulation') and sensor.is_simulation
+
             if await lidar_manager.disconnect_sensor(sensor_id, force=True):
                 disconnected += 1
+                if is_fake:
+                    fake_disconnected += 1
+                else:
+                    real_disconnected += 1
 
         return OperationResponse(
             success=True,
-            message=f"Disconnected {disconnected} sensors",
-            data={"disconnected_count": disconnected}
+            message=f"Disconnected {disconnected} sensors ({fake_disconnected} fake, {real_disconnected} real)",
+            data={
+                "disconnected_count": disconnected,
+                "fake_disconnected": fake_disconnected,
+                "real_disconnected": real_disconnected
+            }
         )
 
     except Exception as e:
