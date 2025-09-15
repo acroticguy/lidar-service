@@ -257,7 +257,7 @@ async def start_operation_by_berth(berth_id: int, operation_type: OperationType,
     Args:
         berth_id: The berth ID to start operation for
         operation_type: The type of operation (BERTH, DRIFT, or UNMOOR)
-        request: Request body with berthing_id
+        request: Request body with berthing_id, use_lidar, and use_laser flags
 
     Returns:
         Dictionary with operation results including:
@@ -272,23 +272,44 @@ async def start_operation_by_berth(berth_id: int, operation_type: OperationType,
     """
     try:
         logger.info(f"Starting berthing operation {operation_type.value} for berth {berth_id}, berthing_id {request.berthing_id}")
+        logger.info(f"Device configuration: use_lidar={request.use_lidar}, use_laser={request.use_laser}")
+
+        # Import device_manager for unified device control
+        from ...services.device_manager import device_manager
+
+        # Configure device manager for this berth operation
+        device_manager.configure_devices(
+            use_lidar=request.use_lidar,
+            use_laser=request.use_laser,
+            berth_id=berth_id,
+        )
 
         # Determine auto_update based on operation_type
         auto_update = operation_type in [OperationType.BERTH, OperationType.UNMOOR]
 
-        result = await lidar_manager.enable_berthing_by_berth(berth_id, None, auto_update, request.berthing_id)
+        # Start the operation using device_manager
+        operation_result = await device_manager.start_operation_by_berth(
+            berth_id=berth_id,
+            operation_type=operation_type,
+            berthing_id=request.berthing_id,
+            auto_update=auto_update
+        )
 
-        if result.get("success"):
+        if operation_result.get("success"):
             logger.info(f"Successfully started berthing operation {operation_type.value} for berth {berth_id}")
             # Add berthing_id and operation_type to result
-            result["berthing_id"] = request.berthing_id
-            result["operation_type"] = operation_type.value
-            return result
+            operation_result["berthing_id"] = request.berthing_id
+            operation_result["operation_type"] = operation_type.value
+            operation_result["device_config"] = {
+                "use_lidar": request.use_lidar,
+                "use_laser": request.use_laser
+            }
+            return operation_result
         else:
-            logger.warning(f"Failed to start berthing operation {operation_type.value} for berth {berth_id}: {result.get('message')}")
+            logger.warning(f"Failed to start berthing operation {operation_type.value} for berth {berth_id}: {operation_result.get('message')}")
             raise HTTPException(
                 status_code=400,
-                detail=result.get("message", f"Failed to start operation for berth {berth_id}")
+                detail=operation_result.get("message", f"Failed to start operation for berth {berth_id}")
             )
 
     except HTTPException:
@@ -476,7 +497,10 @@ async def stop_operation_by_berth(berth_id: int):
     try:
         logger.info(f"Stopping berthing operation for berth {berth_id}")
 
-        result = await lidar_manager.disable_berthing_by_berth(berth_id)
+        # Import device_manager for unified device control
+        from ...services.device_manager import device_manager
+
+        result = await device_manager.stop_operation_by_berth(berth_id)
 
         if result.get("success"):
             logger.info(f"Successfully stopped berthing operation for berth {berth_id}")

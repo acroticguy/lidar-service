@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import math
+import struct
 from typing import Dict, List, Optional, Any
 from ..core.packet_parser import parse_livox_packet
 
@@ -2510,17 +2511,20 @@ class LidarManager:
 
     async def enable_berthing_by_berth(self, berth_id: int, computer_ip: Optional[str] = None, auto_update: bool = False, berthing_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        Enable berthing mode for all lasers associated with a specific berth.
+        Enable berthing mode for all lasers/lidars associated with a specific berth.
 
         This method:
         1. Queries the database via PostgREST to get all lasers for the berth
-        2. Enables berthing mode for those lasers
-        3. Starts database consumer if auto_update is True
+        2. Filters devices by laser_type_id (1=laser, 2=lidar)
+        3. For lasers (type_id=1): starts laser drift compensation
+        4. For lidars (type_id=2): enables berthing mode
+        5. Starts database consumer if auto_update is True
 
         Args:
             berth_id: The berth ID to activate berthing for
             computer_ip: Optional computer IP for sensor discovery
             auto_update: Whether to start the database consumer for automatic data streaming
+            berthing_id: Optional berthing operation ID
 
         Returns:
             Dictionary with activation results
@@ -2554,12 +2558,15 @@ class LidarManager:
                     "berthing_activated": False
                 }
 
-            # Extract sensor IDs from the laser data and store laser info
-            sensor_ids = []
+            # Step 2: Filter devices by laser_type_id and categorize them
+            laser_devices = []  # laser_type_id = 1
+            lidar_devices = []  # laser_type_id = 2
+
             for laser in laser_data:
+                laser_type_id = laser.get('laser_type_id')
                 sensor_id = laser.get('serial')
+
                 if sensor_id:
-                    sensor_ids.append(sensor_id)
                     # Store laser info including name_for_pager for this sensor
                     self.berthing_mode_laser_info[sensor_id] = laser
                     # Store berth_id and berthing_id for this sensor
@@ -2568,53 +2575,92 @@ class LidarManager:
                         "berthing_id": berthing_id
                     }
 
-            logger.info(f"Found {len(sensor_ids)} sensors for berth {berth_id}: {sensor_ids}")
+                    # Categorize by device type
+                    if laser_type_id == 1:
+                        laser_devices.append(sensor_id)
+                        logger.debug(f"Categorized {sensor_id} as laser device")
+                    elif laser_type_id == 2:
+                        lidar_devices.append(sensor_id)
+                        logger.debug(f"Categorized {sensor_id} as lidar device")
+                    else:
+                        logger.warning(f"Unknown laser_type_id {laser_type_id} for sensor {sensor_id}, defaulting to lidar")
+                        lidar_devices.append(sensor_id)
 
-            if not sensor_ids:
-                logger.warning(f"No valid sensor IDs found in laser data for berth {berth_id}")
-                return {
-                    "success": False,
-                    "berth_id": berth_id,
-                    "message": f"No valid sensor IDs found for berth {berth_id}",
-                    "lasers_found": laser_data,
-                    "berthing_activated": False
-                }
+            logger.info(f"Found {len(laser_devices)} laser devices and {len(lidar_devices)} lidar devices for berth {berth_id}")
+            logger.info(f"Laser devices: {laser_devices}")
+            logger.info(f"Lidar devices: {lidar_devices}")
 
-            # Step 2: Enable berthing mode for the discovered sensors
-            logger.info(f"Enabling berthing mode for sensors: {sensor_ids}")
-
-            # Check if berthing mode is already active with other sensors
-            already_active = self.berthing_mode_active and len(self.berthing_mode_sensors) > 0
-            if already_active:
-                logger.info(f"Berthing mode already active with {len(self.berthing_mode_sensors)} sensors, adding berth {berth_id} sensors")
-
-            berthing_result = await self.enable_berthing_mode(sensor_ids, computer_ip)
-
-            # Update the result to reflect that this berth was added to existing berthing mode
-            if already_active and berthing_result.get("active"):
-                berthing_result["message"] = f"Berth {berth_id} sensors added to existing berthing mode"
-
-            # Step 3: Start database streamer if auto_update is enabled
-            db_streamer_started = False
-            if auto_update and berthing_result.get("streaming_sensors"):
+            # Step 3: Handle laser devices (drift compensation)
+            laser_success = True
+            if laser_devices:
                 try:
-                    logger.info(f"Starting database streamer for berth {berth_id} sensors")
+                    from .laser_manager import laser_manager
+                    logger.info(f"Starting laser drift compensation for devices: {laser_devices}")
+
+                    # Configure laser manager for this berth
+                    laser_manager.configure_laser_usage(use_laser=True, berth_id=berth_id)
+
+                    # Start laser drift compensation
+                    if not laser_manager.start_laser_drift_compensation():
+                        logger.error("Failed to start laser drift compensation")
+                        laser_success = False
+                    else:
+                        logger.info("Laser drift compensation started successfully")
+                except Exception as laser_err:
+                    logger.error(f"Error starting laser operations: {laser_err}")
+                    laser_success = False
+
+            # Step 4: Handle lidar devices (berthing mode)
+            lidar_success = True
+            berthing_result = None
+            if lidar_devices:
+                logger.info(f"Enabling berthing mode for lidar devices: {lidar_devices}")
+
+                # Check if berthing mode is already active with other sensors
+                already_active = self.berthing_mode_active and len(self.berthing_mode_sensors) > 0
+                if already_active:
+                    logger.info(f"Berthing mode already active with {len(self.berthing_mode_sensors)} sensors, adding berth {berth_id} lidar sensors")
+
+                berthing_result = await self.enable_berthing_mode(lidar_devices, computer_ip)
+
+                # Update the result to reflect that this berth was added to existing berthing mode
+                if already_active and berthing_result.get("active"):
+                    berthing_result["message"] = f"Berth {berth_id} lidar sensors added to existing berthing mode"
+
+                lidar_success = berthing_result.get("active", False)
+
+            # Step 5: Start database streamer if auto_update is enabled
+            db_streamer_started = False
+            if auto_update and ((berthing_result and berthing_result.get("streaming_sensors")) or laser_devices):
+                try:
+                    logger.info(f"Starting database streamer for berth {berth_id} devices")
                     from .db_streamer_service import db_streamer_service
-                    await db_streamer_service.start_db_streaming(berthing_result["streaming_sensors"])
-                    db_streamer_started = True
-                    logger.info(f"Database streamer started for berth {berth_id}")
+                    # Start streaming for both laser and lidar devices
+                    all_streaming_devices = []
+                    if berthing_result and berthing_result.get("streaming_sensors"):
+                        all_streaming_devices.extend(berthing_result["streaming_sensors"])
+                    all_streaming_devices.extend(laser_devices)
+
+                    if all_streaming_devices:
+                        await db_streamer_service.start_db_streaming(all_streaming_devices)
+                        db_streamer_started = True
+                        logger.info(f"Database streamer started for berth {berth_id}")
                 except Exception as db_err:
                     logger.error(f"Failed to start database streamer for berth {berth_id}: {db_err}")
 
-            # Step 4: Return comprehensive result
+            # Step 6: Return comprehensive result
+            overall_success = laser_success and lidar_success
             result = {
-                "success": berthing_result.get("active", False),
+                "success": overall_success,
                 "berth_id": berth_id,
                 "lasers_found": laser_data,
-                "sensor_ids": sensor_ids,
+                "laser_devices": laser_devices,
+                "lidar_devices": lidar_devices,
+                "laser_operations_success": laser_success,
+                "lidar_operations_success": lidar_success,
                 "berthing_result": berthing_result,
                 "db_consumer_started": db_streamer_started,
-                "message": f"Berthing mode {'activated' if berthing_result.get('active') else 'failed'} for berth {berth_id}"
+                "message": f"Berthing operations {'successful' if overall_success else 'partially failed'} for berth {berth_id}: lasers={laser_success}, lidars={lidar_success}"
             }
 
             logger.info(f"Berth {berth_id} activation result: {result['message']}")

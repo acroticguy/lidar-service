@@ -6,7 +6,7 @@ import time
 import base64
 import queue
 import math
-from ...services.lidar_manager import lidar_manager
+from ...services.device_manager import device_manager
 from ...core.logging_config import logger
 from ...services.berthing_data_core import get_all_berthing_data_core # Import the core data function
 
@@ -188,17 +188,17 @@ async def websocket_point_cloud_stream(websocket: WebSocket, sensor_id: str):
     """Real-time point cloud streaming via WebSocket for a specific sensor."""
     await manager.connect_sensor_stream(websocket, sensor_id) # Use new method
     
-    if sensor_id not in lidar_manager.sensors:
+    if not device_manager.lidar_manager or sensor_id not in device_manager.lidar_manager.sensors:
         await websocket.send_text(json.dumps({
             "type": "error", "message": f"Sensor {sensor_id} not found" }))
         await websocket.close()
         manager.disconnect_sensor_stream(websocket, sensor_id) # Ensure cleanup
         return
-    
+
     streaming_started = False
-    if not lidar_manager.stream_active.get(sensor_id, False):
+    if not device_manager.lidar_manager.stream_active.get(sensor_id, False):
         logger.info(f"Starting data stream for WebSocket client on sensor {sensor_id}")
-        success = await lidar_manager.start_data_stream(sensor_id)
+        success = await device_manager.lidar_manager.start_data_stream(sensor_id)
         if not success:
             await websocket.send_text(json.dumps({
                 "type": "error", "message": f"Failed to start data stream for sensor {sensor_id}" }))
@@ -225,7 +225,7 @@ async def websocket_point_cloud_stream(websocket: WebSocket, sensor_id: str):
             except WebSocketDisconnect:
                 break # Client disconnected
 
-            if sensor_id in lidar_manager.data_queues and not lidar_manager.data_queues[sensor_id].empty():
+            if device_manager.lidar_manager and sensor_id in device_manager.lidar_manager.data_queues and not device_manager.lidar_manager.data_queues[sensor_id].empty():
                 try:
                     # Get data from queue without removing it permanently
                     encoded_data = lidar_manager.data_queues[sensor_id].get_nowait()
@@ -277,7 +277,7 @@ async def websocket_metrics_stream(websocket: WebSocket, sensor_id: str):
     """Real-time metrics streaming via WebSocket for a specific sensor."""
     await manager.connect_sensor_stream(websocket, sensor_id) # Use new method
     
-    if sensor_id not in lidar_manager.sensors:
+    if not device_manager.lidar_manager or sensor_id not in device_manager.lidar_manager.sensors:
         await websocket.send_text(json.dumps({
             "type": "error", "message": f"Sensor {sensor_id} not found" }))
         await websocket.close()
@@ -299,12 +299,12 @@ async def websocket_metrics_stream(websocket: WebSocket, sensor_id: str):
             except WebSocketDisconnect:
                 break
 
-            if sensor_id in lidar_manager.data_queues and not lidar_manager.data_queues[sensor_id].empty():
+            if device_manager.lidar_manager and sensor_id in device_manager.lidar_manager.data_queues and not device_manager.lidar_manager.data_queues[sensor_id].empty():
                 try:
-                    encoded_data = lidar_manager.data_queues[sensor_id].get_nowait()
+                    encoded_data = device_manager.lidar_manager.data_queues[sensor_id].get_nowait()
                     decoded_data = base64.b64decode(encoded_data).decode('utf-8')
                     latest_data = json.loads(decoded_data)
-                    lidar_manager.data_queues[sensor_id].put(encoded_data) # Put it back
+                    device_manager.lidar_manager.data_queues[sensor_id].put(encoded_data) # Put it back
                     
                     metrics_message = {
                         "type": "metrics_data", "timestamp": latest_data["timestamp"],
@@ -473,8 +473,18 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
                     active_berth_sensors = 0
                     for sensor_id, sensor_data in current_data.get("sensors", {}).items():
                         if sensor_id in berth_sensors:
-                            # Double-check sensor is still in berthing mode
-                            if sensor_id in lidar_manager.berthing_mode_sensors:
+                            # Check if sensor is active - either LiDAR in berthing mode or laser device
+                            is_active = False
+                            if sensor_data.get("data_type") == "lidar":
+                                is_active = (device_manager.lidar_manager and
+                                           sensor_id in device_manager.lidar_manager.berthing_mode_sensors)
+                            elif sensor_data.get("data_type") == "laser":
+                                # For laser devices, check if they exist in laser_manager and have data
+                                is_active = (device_manager.laser_manager and
+                                           sensor_id in device_manager.laser_manager.laser_devices and
+                                           sensor_data.get("status") == "active")
+
+                            if is_active:
                                 # Include name_for_pager from laser info if available
                                 laser_info = sensor_laser_info.get(sensor_id, {})
                                 if laser_info.get('name_for_pager'):
@@ -488,7 +498,7 @@ async def websocket_berth_berthing_data_stream(websocket: WebSocket, berth_id: i
                                 if sensor_data.get("status") == "active" and "distance" in sensor_data:
                                     distances.append(sensor_data["distance"])
                             else:
-                                logger.debug(f"Sensor {sensor_id} no longer in berthing mode, excluding from berth {berth_id}")
+                                logger.debug(f"Sensor {sensor_id} no longer active, excluding from berth {berth_id}")
 
                     # Log if berth sensors have changed
                     if active_berth_sensors != len(berth_sensors):

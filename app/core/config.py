@@ -23,8 +23,9 @@ class Settings(BaseSettings):
     CONNECTION_TIMEOUT: int = 30
 
     DB_HOST: str = 'your_ip_address'
-
     DB_PORT: int = 5432
+    
+    LASER_SERVICE_ADDR: str = 'localhost:8080'
 
     class Config:
         env_file = ".env"

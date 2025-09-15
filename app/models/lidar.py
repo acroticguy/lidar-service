@@ -97,6 +97,8 @@ class BerthingModeResponse(BaseModel):
 
 class StartOperationRequest(BaseModel):
     berthing_id: int = Field(..., description="Berthing operation ID")
+    use_lidar: bool = Field(True, description="Whether to use LiDAR sensors for this operation")
+    use_laser: bool = Field(False, description="Whether to use laser sensors for this operation")
 
 
 class ErrorResponse(BaseModel):

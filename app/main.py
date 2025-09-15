@@ -13,7 +13,7 @@ from .api.middleware.error_handler import (
     validation_exception_handler,
     general_exception_handler
 )
-from .services.lidar_manager import lidar_manager
+from .services.device_manager import device_manager
 from .services.db_streamer_service import db_streamer_service
 
 
@@ -25,42 +25,29 @@ async def lifespan(app: FastAPI):
     if settings.AUTO_CONNECT_ON_STARTUP:
         logger.info("Auto-connecting to sensors...")
         try:
-            count = await lidar_manager.auto_connect_all(settings.COMPUTER_IP)
+            count = await device_manager.auto_connect_lidars(settings.COMPUTER_IP)
             logger.info(f"Auto-connected to {count} sensors")
-            
+
             # Do NOT automatically start streaming - only connect
             # Streaming will be initiated manually via API endpoints
-                        
+
         except Exception as e:
             logger.error(f"Error during auto-connect: {str(e)}")
-            
+
     logger.info("Starting global berthing data WebSocket emitter...")
     websocket.manager.start_all_berthing_data_stream()
     
     yield
     
     logger.info("Shutting down Livox LiDAR Service...")
-    
+
     try:
-        sensors = list(lidar_manager.sensors.keys())
-        
-        # First stop all data streams
-        for sensor_id in sensors:
-            if lidar_manager.stream_active.get(sensor_id, False):
-                logger.info(f"Stopping stream for {sensor_id}...")
-                await lidar_manager.stop_data_stream(sensor_id)
-        
-        # Then disconnect all sensors
-        for sensor_id in sensors:
-            # Force disconnect during shutdown
-            await lidar_manager.disconnect_sensor(sensor_id, force=True)
-            
-        logger.info("All sensors stopped and disconnected")
+        await device_manager.shutdown_devices()
 
         if settings.AUTO_UPDATE_DB:
             logger.info("AUTO_UPDATE_DB was active. Stopping database streaming...")
             await db_streamer_service.stop_db_streaming()
-            
+
         logger.info("Stopping global berthing data WebSocket emitter...")
         await websocket.manager.stop_all_berthing_data_stream()
 
@@ -118,9 +105,9 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    sensors_count = len(lidar_manager.sensors)
-    streaming_count = sum(1 for active in lidar_manager.stream_active.values() if active)
-    
+    sensors_count = len(device_manager.lidar_manager.sensors) if device_manager.lidar_manager else 0
+    streaming_count = sum(1 for active in device_manager.lidar_manager.stream_active.values() if active) if device_manager.lidar_manager else 0
+
     return {
         "status": "healthy",
         "sensors_connected": sensors_count,
